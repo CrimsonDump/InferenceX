@@ -16,6 +16,14 @@ mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null || true
 # nothing upstream set it.
 export PORT="${PORT:-8888}"
 
+# 把一个环境变量以 "export VAR=值  # 说明" 格式输出到 stdout(仅当该变量已定义).
+# 供容器内脚本把"命令行之外"的所有环境变量(调优/hack/客户端参数)完整写进 .cmd 文件,
+# 每行一个、自带注释, 便于复现与报告展示. 未设置的变量自动跳过(不产生噪声行).
+emit_env() {
+    local v="$1" c="$2"
+    [[ -n "${!v+x}" ]] && printf 'export %s=%s  # %s\n' "$v" "${!v}" "$c"
+}
+
 agentic_kv_offload_enabled() {
     if [[ -z "${KV_OFFLOADING+x}" || -z "$KV_OFFLOADING" ]]; then
         echo "Error: KV_OFFLOADING must be set for agentic benchmarks" >&2
@@ -529,7 +537,7 @@ run_benchmark_serving() {
         --ignore-eos
         "${profile_flag[@]}"
         --save-result
-        --num-warmups "$((2 * max_concurrency))" \
+        --num-warmups "${NUM_WARMUPS:-$((2 * max_concurrency))}" \
         --percentile-metrics 'ttft,tpot,itl,e2el'
         --result-dir "$result_dir"
         --result-filename "$result_filename.json"

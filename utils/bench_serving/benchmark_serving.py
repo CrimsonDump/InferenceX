@@ -510,6 +510,71 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+def compute_steady_state_metrics(
+    per_req_itls: List[List[float]],
+    ttfts: List[float],
+    output_lens: List[int],
+    gpu_count: int,
+) -> Dict[str, Any]:
+    """纯 decode 稳态采样 (max-TTFT 窗口), 物理保证窗口内无 prefill (见 CLAUDE.md "完全刨去 prefill").
+
+      - 所有请求等长、一次性发出 (num_prompts=concurrency, rate=inf), 近似同时起跑,
+        故用 ttft 作为各请求"首 token 到达时刻"(相对共同原点; 派发抖动 <ms 可忽略).
+      - token j 绝对到达时刻 = ttft + cumsum(itl[:j+1]).
+      - 窗口起点 = max_i(ttft_i): 最后一个请求都出了首 token => 所有请求都已过 prefill;
+        又因 num_prompts 有限且无新请求进来 + enable_mixed_chunk=False,
+        => 此刻起服务端不再有任何 prefill forward, 是纯 decode.
+      - 窗口终点 = min_i(请求结束时刻): 在此之前 batch 恒满 (无请求退出).
+      - 窗内: STPS = 窗内总 token / 窗长; UTPS = 各请求窗内 token 率的中位数.
+    """
+    reqs = []
+    for itl, ttft, olen in zip(per_req_itls, ttfts, output_lens):
+        if not itl or ttft is None or olen <= 1:
+            continue
+        times, t = [], float(ttft)
+        for d in itl:
+            t += d
+            times.append(t)          # 第 k 个流式 chunk 的绝对到达时刻
+        # 每个 ITL 对应一次流式 chunk, 一个 chunk 可能携带多个 token: 例如 MTP 一个
+        # decode step 接受 accept_len 个 token, vllm 把它们放进同一个 SSE chunk =>
+        # len(itl) = chunk 数 < 实际 token 数 (sglang 逐 token 流式则 chunk≈token).
+        # 用 olen/chunk数 折算每 chunk 的 token 数, 使窗内按真实 token 计数, 口径与
+        # 逐 token 后端一致 (否则 MTP 后端 UTPS/STPS 会被低估 accept_len 倍).
+        tpc = float(olen) / len(itl)
+        reqs.append({"ttft": float(ttft), "times": times, "end": times[-1], "tpc": tpc})
+
+    out: Dict[str, Any] = {"gpu_count": gpu_count, "steady_num_reqs": len(reqs)}
+    if not reqs:
+        out["steady_note"] = "no steady-state samples"
+        return out
+
+    win_start = max(r["ttft"] for r in reqs)     # 所有请求都过了 prefill 的时刻
+    win_end = min(r["end"] for r in reqs)        # 第一个请求结束的时刻 (之前 batch 恒满)
+    if win_end <= win_start:
+        out["steady_note"] = "max-TTFT window empty (OSL too short vs prefill spread)"
+        return out
+
+    dur = win_end - win_start
+    rates, total = [], 0.0
+    for r in reqs:
+        # 窗内 chunk 数 × 每 chunk token 数 = 窗内真实 token 数
+        n = sum(1 for tt in r["times"] if win_start <= tt <= win_end) * r["tpc"]
+        total += n
+        rates.append(n / dur)
+    stps = total / dur
+    out.update({
+        "steady_utps_per_user": float(np.median(rates)),   # 曲线横轴 (tok/s/user)
+        "steady_stps_system": float(stps),                 # 系统 tok/s
+        "steady_stps_per_gpu": float(stps / gpu_count) if gpu_count else float(stps),
+        "steady_window_start_s": round(win_start, 4),      # =max(ttft), prefill 全部结束点
+        "steady_window_dur_s": round(dur, 4),
+        "steady_window_tokens_total": round(total, 1),
+        "steady_ttft_min_s": round(min(r["ttft"] for r in reqs), 4),
+        "steady_ttft_max_s": round(win_start, 4),
+    })
+    return out
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -897,6 +962,24 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
         ))
+
+    # 稳态 decode 指标: max-TTFT 窗口 (物理保证无 prefill), 注入结果 JSON.
+    if getattr(args, "steady_state", True):
+        steady = compute_steady_state_metrics(
+            per_req_itls=benchmark_result.get("itls", []),
+            ttfts=benchmark_result.get("ttfts", []),
+            output_lens=benchmark_result.get("output_lens", []),
+            gpu_count=args.gpu_count,
+        )
+        benchmark_result.update(steady)
+        print("{s:{c}^{n}}".format(
+            s=' Steady-State (max-TTFT window, prefill-excluded) ', n=56, c='='))
+        for _k in ("steady_utps_per_user", "steady_stps_system",
+                   "steady_stps_per_gpu", "steady_window_dur_s",
+                   "steady_window_tokens_total", "steady_ttft_min_s",
+                   "steady_ttft_max_s", "steady_num_reqs"):
+            if _k in steady:
+                print("{:<40} {:<12.4f}".format(_k + ":", steady[_k]))
 
     # Save config and results to json
     if args.save_result:
@@ -1290,6 +1373,14 @@ if __name__ == "__main__":
                         "script chooses a LoRA module at random.")
 
     parser.add_argument('--num-warmups', type=int, default=0)
+
+    # 稳态 decode 采样 (max-TTFT 窗口, 物理保证窗内无 prefill)
+    parser.add_argument('--steady-state', action='store_true', default=True,
+                        help="计算稳态 UTPS/STPS(max-TTFT 窗口), 默认开.")
+    parser.add_argument('--no-steady-state', dest='steady_state',
+                        action='store_false')
+    parser.add_argument('--gpu-count', type=int, default=8,
+                        help="用于把系统吞吐换算成每GPU吞吐(STPS/gpu).")
 
     args = parser.parse_args()
     main(args)
