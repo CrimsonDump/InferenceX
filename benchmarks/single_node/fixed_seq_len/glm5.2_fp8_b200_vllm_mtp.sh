@@ -47,6 +47,9 @@ MTP="${MTP:-1}"
 SPEC_NUM_STEPS="${SPEC_NUM_STEPS:-5}"          # = MTP-N (-n), 默认 5
 MTP_DRAFT_PATH="${MTP_DRAFT_PATH:-${MODEL%/model}/mtp}"
 MTP_ACC="${MTP_ACC:-6}"                          # accept_len (-a), synthetic, [1,N+1]
+# accept_len 可为小数(cookbook low-latency 用 3.5) -> 不能用 bash 整数比较
+# ([[ 3.5 -gt 0 ]] 是算术语法错, 会静默不设 synthetic = 没固定住). 统一走 awk 数值比较.
+acc_gt0() { awk -v v="${1:-0}" 'BEGIN{exit !(v + 0 > 0)}'; }
 # vllm 原生语义(由 bench.sh 的 --parallel 预设翻译好): DP=attention 数据并行, EP=0/1 专家并行开关
 DP="${DP:-1}"
 EP="${EP:-0}"
@@ -98,7 +101,7 @@ fi
 # MTP: 拆分的 draft 路径 + 固定 accept_len (synthetic).
 if [[ "$MTP" == "1" ]]; then
     SPEC="{\"method\":\"mtp\",\"model\":\"$MTP_DRAFT_PATH\",\"num_speculative_tokens\":$SPEC_NUM_STEPS"
-    if [[ "$MTP_ACC" -gt 0 ]]; then
+    if acc_gt0 "$MTP_ACC"; then
         SPEC="$SPEC,\"rejection_sample_method\":\"synthetic\",\"synthetic_acceptance_length\":$MTP_ACC"
         echo "固定 MTP: N(num_speculative_tokens)=$SPEC_NUM_STEPS, accept_len(synthetic_acceptance_length)=$MTP_ACC"
     else
@@ -157,7 +160,8 @@ run_succeeded() {
     python3 -c "import json,sys; d=json.load(open('$jf')); sys.exit(0 if d.get('completed',0)>0 else 1)" 2>/dev/null
 }
 
-start_gpu_monitor
+# GPU 指标也写 outdir(不传 --output 会落在 /workspace, 即仓库根, 污染仓库)
+start_gpu_monitor --output "$RESULT_DIR/${RESULT_FILENAME}.gpu_metrics.csv"
 start_server
 # datasets/pandas: 本 client 跑 random 数据集其实用不到(全脚本 0 处 import), 仅为兼容其他数据集
 # 做 best-effort 安装. 必须加 timeout: vllm 镜像未预装 datasets 且容器常连不上 PyPI, 不限时会

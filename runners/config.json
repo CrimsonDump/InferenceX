@@ -1,0 +1,209 @@
+{
+  "_readme": [
+    "bench.sh 的【唯一配置入口】(bash runners/bench.sh [--config 本文件])。",
+    "bench.sh 刻意不提供配置类命令行开关: 同一项两处可写(命令行 + 本文件)会让'这次到底跑",
+    "的是什么'无从判断, 也让 run_config.json 记录失真。要临时试跑就复制一份本文件改完用",
+    "--config 指过去 —— 配置文件本身就是配置的单位。",
+    "",
+    "★当前这份 = 复现 sglang GLM-5.2 cookbook 的 B200/fp8/单节点三档★",
+    "(low-latency / balanced / high-throughput, 见 curves 的 note 与 cookbook_ref)。",
+    "",
+    "三层: defaults = 整次 run 共享的坐标轴/环境; backends = 每个 backend 的构建来源",
+    "(镜像/repo/commit); curves = 图上的每一条线。",
+    "命名也是三层, 各层只放本层统一的字段 (详见 CLAUDE.md「产物与命名」):",
+    "  图   = <model>_<quant>_i<ISL>o<OSL>_c<最小>-<最大>.html (+ 同名目录) <- 出自 defaults",
+    "  曲线 = series, 由 curve 字段推导: <backend>-<commit>-<parallel>-mtpN<N>A<acc>",
+    "         (mtp_n<=0 时 = mtpoff), 进 glm52_<series>_s<sl>_c<b>_r<rep>.json 与图例",
+    "  点   = concurrency(batch), 只在结果文件名的 _c<b> 段, 是曲线的横轴",
+    "曲线**没有**手写 id: backend/commit/parallel/MTP 逐曲线变, 拼起来就是 id。它们属于曲线",
+    "而非图 —— 一张图里可以同时有 sglang 与 vllm、或同一 backend 的两个 commit (A/B 就是加",
+    "两条 curve、commit 填不同值), 所以图名里不出现它们。构建按 (backend, commit) 去重, 同一次",
+    "run 里相同组合只准备一次源码树, 用到它的曲线共用。"
+  ],
+  "_defaults_fields": {
+    "model": "主模型权重目录(容器内可见)。图名的 model/quant 也从这个目录名拆出来",
+    "mtp_draft_path": "EAGLE/MTP draft 目录。本地 checkpoint 的 MTP 层单独放, 必须显式给",
+    "seqlens": "ISL 列表(进图名)。多个值 = 多组 run, 图名里用 + 连",
+    "batches": "并发(concurrency)列表 = 曲线的横轴采样点。curve.batches 可覆盖(三档各扫自己那几个点)",
+    "osl": "输出长度",
+    "reps": "每个点重复次数, 全部原始 JSON 都留",
+    "gpu_count": "GPU 数, 同时是并行预设里的 world size",
+    "outroot": "输出根目录; 实际 outdir = <outroot>/<图名去掉 .html>",
+    "outdir": "可选。显式指定输出目录(跳过自动命名), 用于让两次 run 的结果并存",
+    "src_cache": "build from source 的源码树缓存根: <src_cache>/<backend>-<commit>/",
+    "fetch_proxy": "取源码 tarball 用的代理(节点直连到不了 codeload)。经此代理偶发截断, bench.sh 会校验 tar 并重下",
+    "env": "追加给所有曲线容器的环境变量(调试/逃生阀 + 客户端口径, 如 NUM_WARMUPS / MEM_FRAC / CHUNKED_PREFILL_SIZE / MAX_RUNNING_REQUESTS / KV_CACHE_DTYPE / ARCH_RENAME)。curve.env 覆盖同名键"
+  },
+  "_defaults_note": [
+    "★当前目标: 复现 cookbook 三档★。cookbook 的测速命令(页面上原样):",
+    "  python3 -m sglang.bench_serving --backend sglang --dataset-name random \\",
+    "    --random-input-len 8192 --random-output-len 1024 --random-range-ratio 1.0 \\",
+    "    --num-prompts <N> --max-concurrency <N> --warmup-requests 64 --flush-cache",
+    "对齐的几处(逐项都能在本文件里看到):",
+    " - ISL=8192 / OSL=1024 —— 与 cookbook B200 fp8 单节点同参。",
+    " - num_prompts == max_concurrency(等长齐发一轮): 本项目 client 本来就是这么发的; 已用",
+    "   cookbook 表自身的 TTFT/TPOT/吞吐三列反算核对过(总时长 ≈ 平均 latency), 一致。",
+    " - env.NUM_WARMUPS=64 = cookbook 的 --warmup-requests 64 (本项目默认 0, 这里为对齐打开)。",
+    " - --flush-cache 每点都发(client 默认开, FLUSH_CACHE=0 可关)。",
+    "已知与 cookbook 的【剩余差异】(改不了或不该改, 读数时要记得):",
+    " - 引擎 commit: 我们钉 fdebc938(=基座 v0.5.16 自己的 commit), cookbook 是 main@09ca4fc。",
+    "   原因见 backends.sglang._commit_note(sgl-kernel 版本被基座绑死)。",
+    " - --context-length=16384: 本地 checkpoint 的 max_position=1M, 不设则 KV 池/并发估算按 1M 算。",
+    "   cookbook 用 zai-org 官方权重, 无此问题。",
+    " - architectures 旁路(env.ARCH_BASE): 本地权重标 DeepseekV32ForCausalLM, 旁路成",
+    "   GlmMoeDsaForCausalLM 以走 DSA 自动配置(v0.5.16 上两个名字都能触发, 保留无害)。",
+    " - 权重放共享盘 /tilert/zqk 而非 tmpfs: 只影响加载耗时, 不影响 decode 口径。",
+    "reps=1: 先求一张完整的图; 要误差棒就改成 3(图上出 min-max 须线)。"
+  ],
+  "defaults": {
+    "model": "/tilert/zqk/20260612/glm-5p2-fp8/model",
+    "mtp_draft_path": "/tilert/zqk/20260612/glm-5p2-fp8/mtp",
+    "seqlens": [8192],
+    "batches": [1, 4, 16, 64, 128, 256],
+    "osl": 1024,
+    "reps": 1,
+    "gpu_count": 8,
+    "outroot": "/tilert/xbj/tps_results",
+    "src_cache": "/tilert/xbj/src_cache",
+    "fetch_proxy": "http://10.26.5.219:3128",
+    "env": {
+      "ARCH_BASE": "/tilert/xbj/archbypass",
+      "NUM_WARMUPS": "64"
+    }
+  },
+  "_backend_fields": {
+    "image": "容器镜像。commit 非 null 时它只是【运行时基座】(CUDA/torch/flashinfer/deepep/nvshmem 等依赖), 自带的引擎会被源码那份 editable 覆盖",
+    "repo": "build from source 的 git 仓库(bench.sh 从 codeload 取该 commit 的 tarball)",
+    "commit": "该 backend 的默认 revision。null = 不从源码构建, 用镜像自带版本 (此时 series 名里的 commit 位由镜像探测: 安装目录 git hash -> 镜像 tag 尾部 hash -> 模块版本 -> tag)",
+    "_note": "这里的 commit 只是**默认值**; commit 进 series 名(属曲线), 单条 curve 可用自己的 commit 字段覆盖 -> 同一张图里 A/B 两个 commit。vllm/tokenspeed 目前 null(用镜像), 将来要源码构建同样填这里"
+  },
+  "backends": {
+    "sglang": {
+      "image": "lmsysorg/sglang:latest",
+      "repo": "https://github.com/sgl-project/sglang",
+      "commit": "fdebc938",
+      "_commit_note": [
+        "cookbook 测速用的是 09ca4fc, 但它在这个基座上【跑不起来】—— sgl-kernel 是只存在于镜像里的",
+        "CUDA 扩展, 源码 pyproject 对它是硬版本要求, 三种组合都实测失败:",
+        "  09ca4fc(要 kernel 0.4.4) + latest(带 0.4.5): 0.4.5 删了 fp8_blockwise_scaled_mm -> import 就炸",
+        "  同上 + 从 pypi 降到 0.4.4:                    wheel 不是 cu130 编的 -> 加载权重时 CUDA launch failure",
+        "  09ca4fc + 旧 dev-cu13(带 0.4.1):              低于最低版本, 断言直接抛",
+        "所以钉成【基座自己的 commit fdebc938 = v0.5.16】, 它的 pin 正好是基座自带的 0.4.5, 无需动 kernel。",
+        "代价: 绝对值与 cookbook 有版本差(实测三档 TPOT 差 -2%..+11%)。要严格对齐 09ca4fc 得换成",
+        "kernel==0.4.4 的基座 —— 已探明 lmsysorg/sglang:v0.5.14(2026-06-26, kernel 0.4.4) 或 v0.5.15",
+        "就是, 拉下来后把 image 改成它、commit 改回 09ca4fc; 也可以再加一条 curve 用不同 commit,",
+        "两个版本进同一张图做 A/B。"
+      ]
+    },
+    "vllm": {
+      "image": "vllm/vllm-openai:glm52",
+      "repo": "https://github.com/vllm-project/vllm",
+      "commit": null
+    },
+    "tokenspeed": {
+      "image": "lightseekorg/tokenspeed:glm-radix",
+      "repo": "https://github.com/lightseekorg/tokenspeed",
+      "commit": null
+    }
+  },
+  "_curve_fields": {
+    "backend": "选 backends 里的一项 -> 镜像/源码 + 容器内脚本。进 series 名",
+    "commit": "可选, 覆盖 backends.<backend>.commit; 进 series 名。同图 A/B 两个 commit 就靠它",
+    "parallel": "tp | dep | tep | dpa-tp (vllm 语义 world=tp*dp, 由 bench.sh 翻译成各 backend 的 flag)",
+    "mtp_n": "= --speculative-num-steps, 对应 cookbook spec 的 steps 位 -> env SPEC_NUM_STEPS。<=0 = 不开 spec(series 记 mtpoff, 对应 cookbook high-throughput 那格)。draft-tokens 不用填: sglang 默认 = steps+1, 正是 cookbook 的 5-1-6 / 1-1-2",
+    "mtp_acc": "固定接受长度 -> env MTP_ACC (sglang: SGLANG_SIMULATE_ACC_LEN)。<=0 表示不固定, 走自然接受",
+    "enabled": "false 则跳过 (定义留着备查)",
+    "batches": "可选, 覆盖 defaults.batches (三档各扫 cookbook 给出的那几个并发点)",
+    "env": "可选, 该曲线容器的额外环境变量, 覆盖 defaults.env 的同名键 (三档的 mem-fraction / chunked-prefill 差异就写在这)。★MAX_RUNNING_REQUESTS 只有 cookbook high-throughput 那格才该出现★: 我们自己的测点要求 max-running == 并发(不许排队), 而 bench.sh 默认就是 max-running=本曲线最大并发, 所以正常情况【不要】写这个键 —— 写了就是在人为制造排队",
+    "cookbook_ref": "可选。cookbook 表上该曲线对应格的参考值, 按并发数索引: {ttft_ms, tpot_ms, utps, tps_per_gpu}。只用于报告里出「cookbook 口径对比」表(逐格 Δ%), 不影响怎么跑。注意 utps=1000/tpot_ms, tps_per_gpu 是【含 prefill token】的 (ISL+OSL)*N/总时长/GPU数 —— 与本项目稳态 decode 口径的 UTPS/STPS 不是一回事",
+    "note": "人读备注, 进 run_config.json 与报告"
+  },
+  "curves": [
+    {
+      "backend": "sglang",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 3.5,
+      "enabled": true,
+      "batches": [1, 4, 16, 64, 128, 256],
+      "note": ""
+    },
+    {
+      "backend": "sglang",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 6,
+      "enabled": true,
+      "batches": [1, 4, 16, 64, 128, 256],
+      "note": ""
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dep",
+      "mtp_n": 1,
+      "mtp_acc": 2,
+      "enabled": true,
+      "batches": [1, 4, 16, 64, 128, 256],
+      "note": ""
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dep",
+      "mtp_n": 5,
+      "mtp_acc": 6,
+      "enabled": true,
+      "batches": [1, 4, 16, 64, 128, 256],
+      "note": ""
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dep",
+      "mtp_n": 0,
+      "mtp_acc": 0,
+      "enabled": true,
+      "batches": [1, 4, 16, 64, 128, 256, 1024],
+      "note": ""
+    },
+    {
+      "backend": "sglang",
+      "parallel": "tep",
+      "mtp_n": 5,
+      "mtp_acc": 6,
+      "enabled": true,
+      "batches": [1, 4, 16, 64, 128, 256],
+      "note": ""
+    },
+
+
+
+
+
+
+
+
+    {
+      "backend": "vllm",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 3.5,
+      "enabled": false,
+      "note": "暂缓: 待 sglang 三档复现定稿后按同口径重跑"
+    },
+    {
+      "backend": "vllm",
+      "parallel": "dep",
+      "mtp_n": 1,
+      "mtp_acc": 2,
+      "enabled": false,
+      "note": "暂缓。另: batch>=128 有 decode 吞吐悬崖待查"
+    },
+    {
+      "backend": "tokenspeed",
+      "parallel": "tep",
+      "mtp_n": 5,
+      "mtp_acc": 3.5,
+      "enabled": false,
+      "note": "暂缓, 且只能在 node074/073 跑(node071 8-way 多播对称内存死锁)。dep 有 smg 网关 gRPC 并发 bug(c>=8 全崩), 故 tokenspeed 只有 tep 可用"
+    }
+  ]
+}

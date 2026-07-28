@@ -247,7 +247,6 @@ async def async_request_openai_completions(
                 if request_func_input.model_name else request_func_input.model,
             "prompt": request_func_input.prompt,
             "temperature": 0.0,
-            "best_of": request_func_input.best_of,
             "max_tokens": request_func_input.output_len,
             "logprobs": request_func_input.logprobs,
             "stream": True,
@@ -255,6 +254,11 @@ async def async_request_openai_completions(
                 "include_usage": True,
             },
         }
+        # best_of 只在 >1(真 beam)时发: best_of=1 是默认无操作, 而 TokenSpeed 的 smg 网关
+        # 在 stream=true 时拒收 best_of ("best_of is not supported when stream is enabled" 400).
+        # vllm/sglang 对 best_of=1 无所谓, 故省略对三者都安全.
+        if request_func_input.best_of and request_func_input.best_of > 1:
+            payload["best_of"] = request_func_input.best_of
         if request_func_input.ignore_eos:
             payload["ignore_eos"] = request_func_input.ignore_eos
         if request_func_input.extra_body:

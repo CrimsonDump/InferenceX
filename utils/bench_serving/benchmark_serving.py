@@ -575,6 +575,64 @@ def compute_steady_state_metrics(
     return out
 
 
+async def flush_server_cache(base_url: str, attempts: int = 15,
+                             wait_s: float = 2.0) -> bool:
+    """清 server 端 prefix/radix cache —— cookbook 口径的 `--flush-cache`.
+
+    cookbook 的速度数字是带 `--flush-cache` 测的: 不清的话同一批 prompt 在重复测点
+    (REPS>1) 之间会命中 prefix cache, prefill 变快 -> 稳态窗口起点(max-TTFT)提前,
+    与 cookbook 不可比. 每个测点开测前调一次.
+
+    端点各家不同, 依次试: sglang `/flush_cache`, vllm `/reset_prefix_cache`.
+
+    ★必须真清掉, 所以要重试★: sglang 在【还有请求在跑】时会拒绝清缓存 ——
+    `HTTP 400 "Cache not flushed because there are pending requests. #running-req: 16"`。
+    warmup 的最后一批常常还没 drain 完就撞上这个(实测撞到过: POST 400 -> 1s 后 GET 才成功,
+    纯属侥幸)。所以这里【重试到真成功】, 而不是换个 method/端点赌一次: 赌输了就是带着热
+    prefix cache 开测 —— prefill 变快、TTFT 偏低、稳态窗口起点提前, 与 cookbook 口径不一致,
+    而且事后极难发现(要去 serverlog 里数 `#cached-token` 才看得出来)。
+    只在见到【可重试】的失败(HTTP 400 = 有请求在跑)时才等待重试; 若只见到 404/405
+    (该 backend 压根没这个端点)就立刻放弃, 免得每个测点白等几十秒.
+    """
+    import aiohttp
+
+    endpoints = ("/flush_cache", "/reset_prefix_cache")
+    last = ""
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=120)
+    ) as session:
+        for i in range(attempts):
+            retryable = False
+            for ep in endpoints:
+                url = base_url + ep
+                for method in ("post", "get"):
+                    try:
+                        async with getattr(session, method)(url) as resp:
+                            if resp.status < 400:
+                                print("Flushed server cache: %s %s%s"
+                                      % (method.upper(), url,
+                                         (" (第 %d 次尝试)" % (i + 1)) if i else ""))
+                                return True
+                            body = (await resp.text())[:120].replace("\n", " ")
+                            last = "%s %s -> HTTP %d: %s" % (method.upper(), url,
+                                                             resp.status, body)
+                            # 400 = "有请求在跑, 清不了" -> 等一下就能成; 404/405 = 没这端点
+                            if resp.status == 400:
+                                retryable = True
+                    except Exception as e:  # noqa: BLE001 - 端点不存在/连接问题都试下一个
+                        last = "%s %s -> %s" % (method.upper(), url, type(e).__name__)
+                        continue
+            if not retryable:
+                break
+            if i + 1 < attempts:
+                print("flush cache 暂时清不掉(%s), %.1fs 后重试 %d/%d"
+                      % (last, wait_s, i + 2, attempts))
+                await asyncio.sleep(wait_s)
+    print(f"WARNING: flush cache failed (tried {endpoints} on {base_url}; 末次: {last}); "
+          "结果可能受 prefix cache 影响, 与 cookbook 口径不一致")
+    return False
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -590,6 +648,7 @@ async def benchmark(
     disable_tqdm: bool,
     num_warmups: int,
     profile: bool,
+    flush_cache: bool,
     selected_percentile_metrics: List[str],
     selected_percentiles: List[str],
     ignore_eos: bool,
@@ -642,6 +701,11 @@ async def benchmark(
         if warmup_pbar is not None:
             warmup_pbar.close()
         print("Warmup completed.")
+
+    # 清缓存放在 warmup 之后、正式测点之前: warmup 本身会把 prompt 灌进 prefix cache,
+    # 顺序反了等于没清.
+    if flush_cache:
+        await flush_server_cache(base_url)
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -953,6 +1017,7 @@ def main(args: argparse.Namespace):
             disable_tqdm=args.disable_tqdm,
             num_warmups=args.num_warmups,
             profile=args.profile,
+            flush_cache=args.flush_cache,
             selected_percentile_metrics=args.percentile_metrics.split(","),
             selected_percentiles=[
                 float(p) for p in args.metric_percentiles.split(",")
@@ -1173,6 +1238,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "VLLM_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--flush-cache",
+        action="store_true",
+        help="Flush the server's prefix/radix cache right before the measured "
+        "requests (cookbook 口径; sglang /flush_cache, vllm /reset_prefix_cache). "
+        "Without it, repeated measurements of the same prompts hit the prefix "
+        "cache and prefill gets faster, which shifts the steady-state window.",
     )
     parser.add_argument(
         "--save-result",

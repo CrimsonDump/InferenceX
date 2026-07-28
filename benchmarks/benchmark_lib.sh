@@ -521,6 +521,13 @@ run_benchmark_serving() {
         num_prompts="$max_concurrency"
     fi
 
+    # cookbook 口径: 每个测点开测前清 server 端 prefix/radix cache (否则 REPS>1 时后续
+    # 重复会命中 prefix cache -> prefill 变快、稳态窗口起点偏移, 与 cookbook 不可比).
+    # 端点不存在时 client 只告警不中断 (见 benchmark_serving.py::flush_server_cache).
+    # FLUSH_CACHE=0 可关(对照用).
+    local flush_flag=()
+    [[ "${FLUSH_CACHE:-1}" == "1" ]] && flush_flag+=(--flush-cache)
+
     # Build benchmark command
     local benchmark_cmd=(
         python3 "$workspace_dir/utils/bench_serving/benchmark_serving.py"
@@ -536,6 +543,7 @@ run_benchmark_serving() {
         --request-rate inf
         --ignore-eos
         "${profile_flag[@]}"
+        "${flush_flag[@]}"
         --save-result
         --num-warmups "${NUM_WARMUPS:-$((2 * max_concurrency))}" \
         --percentile-metrics 'ttft,tpot,itl,e2el'
