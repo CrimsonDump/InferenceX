@@ -1,102 +1,111 @@
 {
-  "_readme": [
-    "bench.sh 的【唯一配置入口】(bash runners/bench.sh [--config 本文件])。",
-    "bench.sh 刻意不提供配置类命令行开关: 同一项两处可写(命令行 + 本文件)会让'这次到底跑",
-    "的是什么'无从判断, 也让 run_config.json 记录失真。要临时试跑就复制一份本文件改完用",
-    "--config 指过去 —— 配置文件本身就是配置的单位。",
-    "",
-    "★当前这份 = 复现 sglang GLM-5.2 cookbook 的 B200/fp8/单节点三档★",
-    "(low-latency / balanced / high-throughput, 见 curves 的 note 与 cookbook_ref)。",
-    "",
-    "三层: defaults = 整次 run 共享的坐标轴/环境; backends = 每个 backend 的构建来源",
-    "(镜像/repo/commit); curves = 图上的每一条线。",
-    "命名也是三层, 各层只放本层统一的字段 (详见 CLAUDE.md「产物与命名」):",
-    "  图   = <model>_<quant>_i<ISL>o<OSL>_c<最小>-<最大>.html (+ 同名目录) <- 出自 defaults",
-    "  曲线 = series, 由 curve 字段推导: <backend>-<commit>-<parallel>-mtpN<N>A<acc>",
-    "         (mtp_n<=0 时 = mtpoff), 进 glm52_<series>_s<sl>_c<b>_r<rep>.json 与图例",
-    "  点   = concurrency(batch), 只在结果文件名的 _c<b> 段, 是曲线的横轴",
-    "曲线**没有**手写 id: backend/commit/parallel/MTP 逐曲线变, 拼起来就是 id。它们属于曲线",
-    "而非图 —— 一张图里可以同时有 sglang 与 vllm、或同一 backend 的两个 commit (A/B 就是加",
-    "两条 curve、commit 填不同值), 所以图名里不出现它们。构建按 (backend, commit) 去重, 同一次",
-    "run 里相同组合只准备一次源码树, 用到它的曲线共用。"
-  ],
-  "_defaults_fields": {
-    "model": "主模型权重目录(容器内可见)。图名的 model/quant 也从这个目录名拆出来",
-    "mtp_draft_path": "EAGLE/MTP draft 目录。本地 checkpoint 的 MTP 层单独放, 必须显式给",
-    "seqlens": "ISL 列表(进图名)。多个值 = 多组 run, 图名里用 + 连",
-    "batches": "并发(concurrency)列表 = 曲线的横轴采样点。curve.batches 可覆盖(三档各扫自己那几个点)",
-    "osl": "输出长度",
-    "reps": "每个点重复次数, 全部原始 JSON 都留",
-    "gpu_count": "GPU 数, 同时是并行预设里的 world size",
-    "outroot": "输出根目录; 实际 outdir = <outroot>/<图名去掉 .html>",
-    "outdir": "可选。显式指定输出目录(跳过自动命名), 用于让两次 run 的结果并存",
-    "src_cache": "build from source 的源码树缓存根: <src_cache>/<backend>-<commit>/",
-    "fetch_proxy": "取源码 tarball 用的代理(节点直连到不了 codeload)。经此代理偶发截断, bench.sh 会校验 tar 并重下",
-    "env": "追加给所有曲线容器的环境变量(调试/逃生阀 + 客户端口径, 如 NUM_WARMUPS / MEM_FRAC / CHUNKED_PREFILL_SIZE / MAX_RUNNING_REQUESTS / KV_CACHE_DTYPE / ARCH_RENAME)。curve.env 覆盖同名键"
+  "_readme": {
+    "本文件": [
+      "bench.sh 的唯一配置入口: bash runners/bench.sh [--config 本文件]。临时试跑就复制一份改完用",
+      "--config 指过去 —— 配置文件本身就是配置的单位, 所以 bench.sh 没有任何配置类命令行开关。",
+      "★只有 defaults / backends / curves 三个键会影响运行★; 以 _ 开头的键 loader 一律忽略。",
+      "唯一例外: curves[].note 会被读取(进 run_config.json 与报告的曲线表), 只写一行标签。",
+      "字段名写错 -> loader 直接报错; 一等字段与 env 里同名变量双写 -> 也直接报错。",
+      "本文件只放【字段是什么】; 当前在跑什么、结果如何、踩过什么坑 -> 看 CLAUDE.md。"
+    ],
+    "命名三层(各层只放本层内统一的字段, 详见 CLAUDE.md「产物与命名」)": [
+      "图   = <model>_<quant>_i<ISL>o<OSL>_c<最小>-<最大>.html (+ 同名目录), 出自 defaults",
+      "曲线 = series, 由 curve 字段推导: <backend>-<commit>-<parallel>-mtpN<N>A<acc>",
+      "       (mtp_n<=0 时 = mtpoff), 进结果文件名与图例 —— 曲线没有手写 id",
+      "点   = concurrency(batch), 只在结果文件名的 _c<b> 段, 是曲线的横轴",
+      "所以 backend/commit/parallel/MTP 不进图名(它们逐曲线变), 一张图里可以同时有多 backend、",
+      "多 commit 的曲线。构建按 (backend, commit) 去重, 同组合只准备一次源码树。"
+    ],
+    "defaults 字段": {
+      "model": "主模型权重目录(容器内可见)。图名的 model/quant 从这个目录名拆出来。指本地 tmpfs 比共享盘快 3 倍(只影响起服务耗时, 不影响测量口径)",
+      "mtp_draft_path": "EAGLE/MTP draft 目录(与 model 同一存储)。本地 checkpoint 的 MTP 层单独放, 必须显式给",
+      "seqlens": "ISL 列表(进图名)。多个值 = 多组 run, 图名里用 + 连",
+      "batches": "并发(concurrency)列表 = 曲线的横轴采样点。curves[].batches 可覆盖",
+      "osl": "输出长度(进图名)",
+      "reps": "每个点重复次数, 全部原始 JSON 都留。=1 时图上无误差棒, 想要 min-max 须线改成 3",
+      "gpu_count": "GPU 数, 同时是并行预设里的 world size; 也是每卡吞吐的除数(传给 client 的 --gpu-count)",
+      "metric_mode": [
+        "★全局测量口径★ = 曲线两个轴怎么算, 两个取值:",
+        "  steady-decode  刨 prefill: 取 max-TTFT 稳态窗口(窗内物理上无 prefill forward)。UTPS =",
+        "                 各请求窗内速率中位数; STPS/gpu = 窗内 decode token/窗长/gpu(只有 output",
+        "                 token)。窗口空的点判 ERR 排除出曲线(高并发常触发)。",
+        "  whole-run      不刨 prefill: UTPS = 1000/mean_TPOT(覆盖请求全程); STPS/gpu =",
+        "                 (ISL+OSL)×完成数/总时长/gpu【含 input token】。不需要窗口。",
+        "两套口径的原始量每个结果 JSON 里都有(客户端无条件都算), 本字段只决定报告端画哪套 —— 换",
+        "口径【不用重跑】, 改完直接跑 aggregate_and_plot.py。跨口径的数不可比, 故它是全局的。",
+        "MFU/MBU 不随本字段变: 恒按稳态 decode 的 step 时长算(decode step 的物理量), 所以稳态窗口",
+        "无效的点这两列留空, 即使该点在 whole-run 下有 UTPS/STPS。"
+      ],
+      "num_warmups": "client 正式测点前的 warmup 请求数(0=关)",
+      "quantization": "= --quantization。不给 = 让引擎按权重目录的 quantization_config 自动识别(fp8 权重就这样)。modelopt 导出的 NVFP4 权重自动识别不到那条 kernel 路径, 必须显式给 modelopt_fp4",
+      "arch_base": "architectures 旁路目录的落点(须可写)。权重在只读区时必须给, 见 glm52_arch_bypass.sh",
+      "outroot": "输出根目录; 实际 outdir = <outroot>/<图名去掉 .html>",
+      "outdir": "可选。显式指定输出目录(跳过自动命名), 用于让两次 run 的结果并存(否则同图名的旧结果会被移进 _prev_<时间戳>/)",
+      "src_cache": "build from source 的源码树缓存根: <src_cache>/<backend>-<commit>/",
+      "fetch_proxy": "取源码 tarball 用的代理。经代理下大文件会偶发截断, bench.sh 会校验 tar 并重下",
+      "env": "追加给所有曲线容器的环境变量 —— 只该放调试/逃生阀(AR_FUSION / ARCH_RENAME / SERVER_WARMUP / FLUSH_CACHE / WATCHDOG_TIMEOUT / SGLANG_ENABLE_JIT_DEEPGEMM / VLLM_ALLREDUCE_USE_SYMM_MEM 之类)。常用量都有一等字段, 别往这里塞(KV_CACHE_DTYPE 已升为 curve 的 kv_cache_dtype 字段, 两处都写会直接报错); curves[].env 覆盖同名键"
+    },
+    "backends 字段": {
+      "image": "容器镜像。commit 非 null 时它只是运行时基座(CUDA/torch/flashinfer/deepep/sgl-kernel/deep_gemm 等), 自带的引擎会被源码那份 editable 覆盖",
+      "repo": "build from source 的 git 仓库(bench.sh 从 codeload 取该 commit 的 tarball, 不是 clone)",
+      "commit": "该 backend 的默认 revision。null = 不从源码构建、用镜像自带版本(此时 series 名里的 commit 位由镜像探测: 安装目录 git hash -> 镜像 tag 尾部 hash -> 模块版本 -> tag)",
+      "作用域": "这里的 image/commit 只是默认值, 单条 curve 可各自覆盖 -> 同一张图里 A/B 两个版本"
+    },
+    "curves 字段": {
+      "backend": "选 backends 里的一项 -> 镜像/源码 + 容器内脚本。进 series 名",
+      "commit": "可选, 覆盖 backends.<backend>.commit; 进 series 名。同图 A/B 两个 commit 就靠它",
+      "image": "可选, 覆盖 backends.<backend>.image。★换 commit 常常得连镜像一起换★: sgl-kernel 与 deep_gemm 只在镜像里、又被源码硬性依赖, 所以 A/B 两臂各要配对自己的基座。同一 (backend, commit) 指两个不同 image 会报错(series 名里没有 image, 两条线会撞)",
+      "parallel": "tp=纯TP | dep=attn DP + MoE EP(deepep) | tep=attn TP + MoE EP | dpa-tp=attn DP + MoE TP。以 vllm 语义 world=tp*dp 为准, 由 bench.sh 翻译成各 backend 的 flag",
+      "mtp_n": "= --speculative-num-steps。<=0 = 不开 spec(series 记 mtpoff)。draft-tokens 不用填, sglang 默认 = steps+1",
+      "mtp_acc": "固定接受长度(sglang: SGLANG_SIMULATE_ACC_LEN + match-expected)。<=0 = 走自然接受。★UTPS 与它成正比★(N 固定时每 step 的算力/字节与接受几个 token 无关), 所以不同 acc 的曲线之间不能比引擎快慢",
+      "enabled": "false 则跳过(定义留着备查)",
+      "batches": "可选, 覆盖 defaults.batches",
+      "num_prompts": "可选, 逐点的 client --num-prompts, 必须与 batches 一一对应(它是【点】级的量)。不给 = num_prompts==并发 = 等长齐发一轮(本项目一直的口径)。★给成大于并发的值就是另一种发压方式★: 请求流水线补位, 稳态里始终有新请求在 prefill, TPOT/TTFT 统计构成不同, 与齐发一轮的数不可混比。cookbook 的 nvfp4 复现命令属于这一类(c=1 发 8 条 / c=16 发 64 条)",
+      "mem_frac": "= --mem-fraction-static。不给则脚本按并行猜(EP 0.80 / 非 EP 0.85)",
+      "chunked_prefill_size": "= --chunked-prefill-size; \"off\" = 不下发该 flag(走 sglang 默认, B200 上 16384); 不给则脚本用 32768。注意开 dp-attention 时 sglang 会把它强制夹到 4096",
+      "max_running_requests": "= --max-running-requests。★我们自己的曲线不要给★: 不给时 bench.sh 用本曲线最大并发, 即 max-running == 并发、不排队; 给小于并发的值就是人为制造排队。\"off\" = 不下发, 交给 sglang 自己按显存/上下文推",
+      "context_length": "= --context-length, 不给则 16384; \"off\" = 不下发(此时按权重的 max_position 算 KV 池/并发上限, GLM-5.2 是 1M)",
+      "cuda_graph_max_bs": "= --cuda-graph-max-bs, 不给则用本曲线最大并发(不设时 sglang 默认 ~160, 超过它的并发退 eager 会明显变慢); \"off\" = 不下发。注意 deepep 的 num_max_dispatch 也按它推算",
+      "kv_cache_dtype": "= --kv-cache-dtype。★取值是各 backend 原生的名字, 不通用★(vllm: fp8_e4m3 | tokenspeed: fp8 | sglang: fp8_e4m3/bfloat16), 所以跨 backend 同图时【别写在 defaults 级】, 要写就逐曲线写。不给时各 backend 取自己的正确默认: vllm fp8_e4m3(★官方 recipe 有这个 flag, 漏给就是 auto=bf16 -> KV 字节翻倍且 KV 池减半, 曾是三 backend 对比失真的最大单一原因★) / tokenspeed fp8 / sglang 不下发(让 DSA 自动配置选 fp8_e4m3)。\"off\" = 不下发该 flag",
+      "all2all_backend": "= MoE all-to-all 后端(vllm --all2all-backend / sglang --moe-a2a-backend), 只在 EP 曲线(dep/tep)生效。★取值同样是各 backend 原生的名字★(vllm: deepep_low_latency/deepep_high_throughput/allgather_reducescatter/... | sglang: deepep)。不给则都用 deepep 系(vllm deepep_low_latency, sglang deepep) = dep/tep 预设本来的定义; 选 low_latency 而非 high_throughput 是因为这是 decode benchmark。\"off\" = 不下发(vllm 会退回默认的 naive allgather_reducescatter)",
+      "attention_backend": "= vllm --attention-backend (目前只有 vllm 侧实现; sglang 的注意力后端由 DSA 自动配置推, 不用这个字段)。不给 = 走引擎自动选择(Blackwell 上 vllm 自动选 FLASHINFER_MLA_SPARSE)。★存在的理由★: FLASHMLA_SPARSE 不在自动候选里、必须显式点名, 它换的是 KV 布局(DeepSeek fp8_ds_mla 打包格式)与 decode kernel, 是要 A/B 的量; 且 0.26.0 已无 VLLM_ATTENTION_BACKEND 环境变量, 只能走 CLI。\"off\"/\"auto\" = 不下发",
+      "env": "可选, 该曲线容器的额外环境变量(调试/逃生阀), 覆盖 defaults.env 同名键",
+      "note": "★唯一会被读取的说明字段★: 进 run_config.json 与报告的曲线表。只写一行标签"
+    }
   },
-  "_defaults_note": [
-    "★当前目标: 复现 cookbook 三档★。cookbook 的测速命令(页面上原样):",
-    "  python3 -m sglang.bench_serving --backend sglang --dataset-name random \\",
-    "    --random-input-len 8192 --random-output-len 1024 --random-range-ratio 1.0 \\",
-    "    --num-prompts <N> --max-concurrency <N> --warmup-requests 64 --flush-cache",
-    "对齐的几处(逐项都能在本文件里看到):",
-    " - ISL=8192 / OSL=1024 —— 与 cookbook B200 fp8 单节点同参。",
-    " - num_prompts == max_concurrency(等长齐发一轮): 本项目 client 本来就是这么发的; 已用",
-    "   cookbook 表自身的 TTFT/TPOT/吞吐三列反算核对过(总时长 ≈ 平均 latency), 一致。",
-    " - env.NUM_WARMUPS=64 = cookbook 的 --warmup-requests 64 (本项目默认 0, 这里为对齐打开)。",
-    " - --flush-cache 每点都发(client 默认开, FLUSH_CACHE=0 可关)。",
-    "已知与 cookbook 的【剩余差异】(改不了或不该改, 读数时要记得):",
-    " - 引擎 commit: 我们钉 fdebc938(=基座 v0.5.16 自己的 commit), cookbook 是 main@09ca4fc。",
-    "   原因见 backends.sglang._commit_note(sgl-kernel 版本被基座绑死)。",
-    " - --context-length=16384: 本地 checkpoint 的 max_position=1M, 不设则 KV 池/并发估算按 1M 算。",
-    "   cookbook 用 zai-org 官方权重, 无此问题。",
-    " - architectures 旁路(env.ARCH_BASE): 本地权重标 DeepseekV32ForCausalLM, 旁路成",
-    "   GlmMoeDsaForCausalLM 以走 DSA 自动配置(v0.5.16 上两个名字都能触发, 保留无害)。",
-    " - 权重放共享盘 /tilert/zqk 而非 tmpfs: 只影响加载耗时, 不影响 decode 口径。",
-    "reps=1: 先求一张完整的图; 要误差棒就改成 3(图上出 min-max 须线)。"
-  ],
   "defaults": {
-    "model": "/tilert/zqk/20260612/glm-5p2-fp8/model",
-    "mtp_draft_path": "/tilert/zqk/20260612/glm-5p2-fp8/mtp",
-    "seqlens": [8192],
-    "batches": [1, 4, 16, 64, 128, 256],
+    "model": "/mnt/ramweights/glm-5p2-nvfp4/model",
+    "mtp_draft_path": "/mnt/ramweights/glm-5p2-nvfp4/model",
+    "quantization": "modelopt_fp4",
+    "seqlens": [
+      8192
+    ],
+    "batches": [
+      1,
+      16,
+      64,
+      256,
+      1024
+    ],
     "osl": 1024,
     "reps": 1,
     "gpu_count": 8,
+    "metric_mode": "whole-run",
+    "num_warmups": 64,
+    "arch_base": "/tilert/xbj/archbypass",
     "outroot": "/tilert/xbj/tps_results",
     "src_cache": "/tilert/xbj/src_cache",
     "fetch_proxy": "http://10.26.5.219:3128",
-    "env": {
-      "ARCH_BASE": "/tilert/xbj/archbypass",
-      "NUM_WARMUPS": "64"
-    }
-  },
-  "_backend_fields": {
-    "image": "容器镜像。commit 非 null 时它只是【运行时基座】(CUDA/torch/flashinfer/deepep/nvshmem 等依赖), 自带的引擎会被源码那份 editable 覆盖",
-    "repo": "build from source 的 git 仓库(bench.sh 从 codeload 取该 commit 的 tarball)",
-    "commit": "该 backend 的默认 revision。null = 不从源码构建, 用镜像自带版本 (此时 series 名里的 commit 位由镜像探测: 安装目录 git hash -> 镜像 tag 尾部 hash -> 模块版本 -> tag)",
-    "_note": "这里的 commit 只是**默认值**; commit 进 series 名(属曲线), 单条 curve 可用自己的 commit 字段覆盖 -> 同一张图里 A/B 两个 commit。vllm/tokenspeed 目前 null(用镜像), 将来要源码构建同样填这里"
+    "env": {}
   },
   "backends": {
     "sglang": {
       "image": "lmsysorg/sglang:latest",
       "repo": "https://github.com/sgl-project/sglang",
-      "commit": "fdebc938",
-      "_commit_note": [
-        "cookbook 测速用的是 09ca4fc, 但它在这个基座上【跑不起来】—— sgl-kernel 是只存在于镜像里的",
-        "CUDA 扩展, 源码 pyproject 对它是硬版本要求, 三种组合都实测失败:",
-        "  09ca4fc(要 kernel 0.4.4) + latest(带 0.4.5): 0.4.5 删了 fp8_blockwise_scaled_mm -> import 就炸",
-        "  同上 + 从 pypi 降到 0.4.4:                    wheel 不是 cu130 编的 -> 加载权重时 CUDA launch failure",
-        "  09ca4fc + 旧 dev-cu13(带 0.4.1):              低于最低版本, 断言直接抛",
-        "所以钉成【基座自己的 commit fdebc938 = v0.5.16】, 它的 pin 正好是基座自带的 0.4.5, 无需动 kernel。",
-        "代价: 绝对值与 cookbook 有版本差(实测三档 TPOT 差 -2%..+11%)。要严格对齐 09ca4fc 得换成",
-        "kernel==0.4.4 的基座 —— 已探明 lmsysorg/sglang:v0.5.14(2026-06-26, kernel 0.4.4) 或 v0.5.15",
-        "就是, 拉下来后把 image 改成它、commit 改回 09ca4fc; 也可以再加一条 curve 用不同 commit,",
-        "两个版本进同一张图做 A/B。"
-      ]
+      "commit": "fdebc938"
     },
     "vllm": {
-      "image": "vllm/vllm-openai:glm52",
+      "image": "vllm/vllm-openai:v0.26.0",
       "repo": "https://github.com/vllm-project/vllm",
       "commit": null
     },
@@ -106,88 +115,511 @@
       "commit": null
     }
   },
-  "_curve_fields": {
-    "backend": "选 backends 里的一项 -> 镜像/源码 + 容器内脚本。进 series 名",
-    "commit": "可选, 覆盖 backends.<backend>.commit; 进 series 名。同图 A/B 两个 commit 就靠它",
-    "parallel": "tp | dep | tep | dpa-tp (vllm 语义 world=tp*dp, 由 bench.sh 翻译成各 backend 的 flag)",
-    "mtp_n": "= --speculative-num-steps, 对应 cookbook spec 的 steps 位 -> env SPEC_NUM_STEPS。<=0 = 不开 spec(series 记 mtpoff, 对应 cookbook high-throughput 那格)。draft-tokens 不用填: sglang 默认 = steps+1, 正是 cookbook 的 5-1-6 / 1-1-2",
-    "mtp_acc": "固定接受长度 -> env MTP_ACC (sglang: SGLANG_SIMULATE_ACC_LEN)。<=0 表示不固定, 走自然接受",
-    "enabled": "false 则跳过 (定义留着备查)",
-    "batches": "可选, 覆盖 defaults.batches (三档各扫 cookbook 给出的那几个并发点)",
-    "env": "可选, 该曲线容器的额外环境变量, 覆盖 defaults.env 的同名键 (三档的 mem-fraction / chunked-prefill 差异就写在这)。★MAX_RUNNING_REQUESTS 只有 cookbook high-throughput 那格才该出现★: 我们自己的测点要求 max-running == 并发(不许排队), 而 bench.sh 默认就是 max-running=本曲线最大并发, 所以正常情况【不要】写这个键 —— 写了就是在人为制造排队",
-    "cookbook_ref": "可选。cookbook 表上该曲线对应格的参考值, 按并发数索引: {ttft_ms, tpot_ms, utps, tps_per_gpu}。只用于报告里出「cookbook 口径对比」表(逐格 Δ%), 不影响怎么跑。注意 utps=1000/tpot_ms, tps_per_gpu 是【含 prefill token】的 (ISL+OSL)*N/总时长/GPU数 —— 与本项目稳态 decode 口径的 UTPS/STPS 不是一回事",
-    "note": "人读备注, 进 run_config.json 与报告"
-  },
   "curves": [
     {
       "backend": "sglang",
       "parallel": "tp",
       "mtp_n": 5,
-      "mtp_acc": 3.5,
+      "mtp_acc": 5,
+      "mem_frac": 0.85,
+      "chunked_prefill_size": 8192,
+      "context_length": "off",
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256
+      ],
       "enabled": true,
-      "batches": [1, 4, 16, 64, 128, 256],
-      "note": ""
+      "note": "nvfp4 · sglang 0.5.16 · ll 曲线 · tp · MTP N5 acc5"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dpa-tp",
+      "mtp_n": 2,
+      "mtp_acc": 2.5,
+      "mem_frac": 0.92,
+      "chunked_prefill_size": 32768,
+      "context_length": "off",
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256
+      ],
+      "enabled": true,
+      "note": "nvfp4 · sglang 0.5.16 · balanced 曲线 · dpa-tp(attn DP8 + MoE TP) · MTP N2 acc2.5"
+    },
+    {
+      "backend": "vllm",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 5,
+      "cudagraph_mode": "FULL_DECODE_ONLY",
+      "env": {
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_ENGINE_READY_TIMEOUT_S": "1800"
+      },
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256
+      ],
+      "enabled": true,
+      "note": "nvfp4 · vllm 0.26.0 · ll 曲线 · tp · MTP N5 acc5(synthetic) · V2 runner + cudagraph FULL_DECODE_ONLY(实测最优); balanced 曲线放弃 —— dpa-tp+spec 撞 vllm 上游缺陷"
+    },
+    {
+      "backend": "vllm",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 5,
+      "cudagraph_mode": "FULL_DECODE_ONLY",
+      "env": {
+        "VLLM_USE_V2_MODEL_RUNNER": "1"
+      },
+      "batches": [
+        1,
+        16
+      ],
+      "enabled": false,
+      "note": "【历史】nvfp4 · vllm 0.26.0 · ll 档 · MTP N5 acc5 · tp8 · 按官方 GLM-5.2-NVFP4 博客加 V2 model runner + cudagraph FULL_DECODE_ONLY"
+    },
+    {
+      "backend": "vllm",
+      "parallel": "dep",
+      "mtp_n": 2,
+      "mtp_acc": 2.5,
+      "all2all_backend": "flashinfer_nvlink_two_sided",
+      "cudagraph_mode": "FULL_DECODE_ONLY",
+      "env": {
+        "VLLM_USE_V2_MODEL_RUNNER": "1"
+      },
+      "batches": [
+        64,
+        256
+      ],
+      "enabled": false,
+      "note": "【历史】nvfp4 · vllm 0.26.0 · balanced 档 · MTP N2 acc2.5 · dep(-ep -tp1 -dp8)+flashinfer_nvlink_two_sided, 对齐官方博客 decode 节点(注: sglang 那档是 MoE TP, 此处为 vllm 最优而非逐 flag 对齐)"
+    },
+    {
+      "backend": "vllm",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 5,
+      "batches": [
+        1,
+        16
+      ],
+      "enabled": false,
+      "note": "【基线·无 V2runner/FULL_DECODE_ONLY】nvfp4 · vllm 0.26.0 · low-latency 档 (c=1/16) · MTP N5 acc5(synthetic, 与 sglang 同值) · tp8 · KV fp8_e4m3 · --async-scheduling · mem 0.9(vllm recipe 默认)"
+    },
+    {
+      "backend": "vllm",
+      "parallel": "dpa-tp",
+      "mtp_n": 2,
+      "mtp_acc": 2.5,
+      "batches": [
+        64,
+        256
+      ],
+      "enabled": false,
+      "note": "【坏组合·勿用】vllm dpa-tp(DP8 无EP)+spec 在官方0.26.0 上 RPC sample_tokens 超时->EngineDead(2026-07-29 实测, completed=0); nvfp4 · vllm 0.26.0 · balanced 档 (c=64/256) · MTP N2 acc2.5(synthetic) · attn DP8 + MoE TP(dpa-tp, 对齐 sglang 的 --dp 8 --enable-dp-attention 无 deepep)"
     },
     {
       "backend": "sglang",
       "parallel": "tp",
       "mtp_n": 5,
-      "mtp_acc": 6,
-      "enabled": true,
-      "batches": [1, 4, 16, 64, 128, 256],
-      "note": ""
+      "mtp_acc": 5,
+      "mem_frac": 0.85,
+      "chunked_prefill_size": 8192,
+      "max_running_requests": "off",
+      "context_length": "off",
+      "cuda_graph_max_bs": "off",
+      "batches": [
+        1,
+        16
+      ],
+      "enabled": false,
+      "note": "【已跑完·定稿在 tps_results/glm-5p2_nvfp4_i8192o1024_c1-1024】cookbook nvfp4 low-latency 档 (c=1/16) · ★acc=5 (= 5/6 接受率, 低于实测饱和值 6.00)★ — serve: --tp 8 --quantization modelopt_fp4 --speculative-algorithm EAGLE 5-1-6 --chunked-prefill-size 8192 --mem-fraction-static 0.85"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dpa-tp",
+      "mtp_n": 2,
+      "mtp_acc": 2.5,
+      "mem_frac": 0.92,
+      "chunked_prefill_size": 32768,
+      "max_running_requests": 256,
+      "context_length": "off",
+      "cuda_graph_max_bs": "off",
+      "batches": [
+        64,
+        256
+      ],
+      "enabled": false,
+      "note": "【已跑完·定稿在 tps_results/glm-5p2_nvfp4_i8192o1024_c1-1024】cookbook nvfp4 balanced 档 (c=64/256) · ★acc=2.5 (= 2.5/3 接受率, 与 ll 档同口径; 实测饱和值 2.92)★ — serve: --tp 8 --dp 8 --enable-dp-attention (无 deepep -> MoE 走 TP, 故 parallel=dpa-tp) --speculative 2-1-3 --chunked-prefill-size 32768 --mem-fraction-static 0.92 --max-running-requests 256"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dpa-tp",
+      "mtp_n": 0,
+      "mtp_acc": 0,
+      "mem_frac": 0.92,
+      "chunked_prefill_size": 32768,
+      "max_running_requests": 512,
+      "context_length": "off",
+      "cuda_graph_max_bs": "off",
+      "batches": [
+        1024
+      ],
+      "enabled": false,
+      "note": "【已跑完·定稿在 tps_results/glm-5p2_nvfp4_i8192o1024_c1-1024】cookbook nvfp4 high-throughput 档 (c=1024, 无 spec) — serve: --tp 8 --dp 8 --enable-dp-attention --chunked-prefill-size 32768 --mem-fraction-static 0.92 --max-running-requests 512"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 3.5,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256
+      ],
+      "enabled": false,
+      "note": "【fp8 权重】三 backend 对比 ·sglang 0.5.16(fdebc938) · tp · MTP N5 acc3.5"
     },
     {
       "backend": "sglang",
       "parallel": "dep",
       "mtp_n": 1,
       "mtp_acc": 2,
-      "enabled": true,
-      "batches": [1, 4, 16, 64, 128, 256],
-      "note": ""
-    },
-    {
-      "backend": "sglang",
-      "parallel": "dep",
-      "mtp_n": 5,
-      "mtp_acc": 6,
-      "enabled": true,
-      "batches": [1, 4, 16, 64, 128, 256],
-      "note": ""
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256
+      ],
+      "enabled": false,
+      "note": "【fp8 权重】三 backend 对比 ·sglang 0.5.16(fdebc938) · dep · MTP N1 acc2"
     },
     {
       "backend": "sglang",
       "parallel": "dep",
       "mtp_n": 0,
       "mtp_acc": 0,
-      "enabled": true,
-      "batches": [1, 4, 16, 64, 128, 256, 1024],
-      "note": ""
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256,
+        1024
+      ],
+      "enabled": false,
+      "note": "【fp8 权重】三 backend 对比 ·sglang 0.5.16(fdebc938) · dep · 无 spec"
+    },
+    {
+      "backend": "vllm",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 3.5,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256
+      ],
+      "enabled": false,
+      "note": "【fp8 权重】三 backend 对比 ·vllm(镜像自带) · tp · MTP N5 acc3.5"
+    },
+    {
+      "backend": "vllm",
+      "parallel": "dep",
+      "mtp_n": 1,
+      "mtp_acc": 2,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256
+      ],
+      "enabled": false,
+      "note": "【fp8 权重】三 backend 对比 ·vllm(镜像自带) · dep · MTP N1 acc2"
+    },
+    {
+      "backend": "vllm",
+      "parallel": "dep",
+      "mtp_n": 0,
+      "mtp_acc": 0,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256,
+        1024
+      ],
+      "enabled": false,
+      "note": "【fp8 权重】三 backend 对比 ·vllm(镜像自带) · dep · 无 spec"
+    },
+    {
+      "backend": "tokenspeed",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 3.5,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256
+      ],
+      "enabled": false,
+      "note": "【fp8 权重】三 backend 对比 ·tokenspeed(镜像自带) · tp · MTP N5 acc3.5"
+    },
+    {
+      "backend": "tokenspeed",
+      "parallel": "dep",
+      "mtp_n": 1,
+      "mtp_acc": 2,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256
+      ],
+      "enabled": false,
+      "note": "【fp8 权重】三 backend 对比 ·tokenspeed(镜像自带) · dep · MTP N1 acc2"
+    },
+    {
+      "backend": "tokenspeed",
+      "parallel": "dep",
+      "mtp_n": 0,
+      "mtp_acc": 0,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        256,
+        1024
+      ],
+      "enabled": false,
+      "note": "【fp8 权重】三 backend 对比 ·tokenspeed(镜像自带) · dep · 无 spec"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 3.5,
+      "mem_frac": 0.8,
+      "chunked_prefill_size": "off",
+      "max_running_requests": "off",
+      "context_length": "off",
+      "batches": [
+        1,
+        16
+      ],
+      "enabled": false,
+      "note": "cookbook low-latency 档 (c=1/16); serve 命令与参考数见 CLAUDE.md「cookbook 三档复现定稿」"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dep",
+      "mtp_n": 1,
+      "mtp_acc": 2,
+      "mem_frac": 0.85,
+      "chunked_prefill_size": 32768,
+      "max_running_requests": 256,
+      "context_length": "off",
+      "batches": [
+        64,
+        256
+      ],
+      "enabled": false,
+      "note": "cookbook balanced 档 (c=64/256); serve 命令与参考数见 CLAUDE.md「cookbook 三档复现定稿」"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dep",
+      "mtp_n": 0,
+      "mtp_acc": 0,
+      "mem_frac": 0.85,
+      "chunked_prefill_size": "off",
+      "max_running_requests": 256,
+      "context_length": "off",
+      "batches": [
+        1024
+      ],
+      "enabled": false,
+      "note": "cookbook high-throughput 档 (c=1024, 无 spec, 故意排队); serve 命令与参考数见 CLAUDE.md「cookbook 三档复现定稿」"
+    },
+    {
+      "backend": "sglang",
+      "commit": "09ca4fc",
+      "image": "lmsysorg/sglang:v0.5.15.post1",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 3.5,
+      "mem_frac": 0.8,
+      "chunked_prefill_size": "off",
+      "max_running_requests": "off",
+      "context_length": "off",
+      "batches": [
+        1,
+        16
+      ],
+      "enabled": false,
+      "note": "A/B 的 cookbook 引擎臂 · low-latency 档 — 当前跑不了(deep_gemm ue8m0 断言), 见 CLAUDE.md TODO"
+    },
+    {
+      "backend": "sglang",
+      "commit": "09ca4fc",
+      "image": "lmsysorg/sglang:v0.5.15.post1",
+      "parallel": "dep",
+      "mtp_n": 1,
+      "mtp_acc": 2,
+      "mem_frac": 0.85,
+      "chunked_prefill_size": 32768,
+      "max_running_requests": 256,
+      "context_length": "off",
+      "batches": [
+        64,
+        256
+      ],
+      "enabled": false,
+      "note": "A/B 的 cookbook 引擎臂 · balanced 档 — 当前跑不了(deep_gemm ue8m0 断言), 见 CLAUDE.md TODO"
+    },
+    {
+      "backend": "sglang",
+      "commit": "09ca4fc",
+      "image": "lmsysorg/sglang:v0.5.15.post1",
+      "parallel": "dep",
+      "mtp_n": 0,
+      "mtp_acc": 0,
+      "mem_frac": 0.85,
+      "chunked_prefill_size": "off",
+      "max_running_requests": 256,
+      "context_length": "off",
+      "batches": [
+        1024
+      ],
+      "enabled": false,
+      "note": "A/B 的 cookbook 引擎臂 · high-throughput 档 — 当前跑不了(deep_gemm ue8m0 断言), 见 CLAUDE.md TODO"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 3.5,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        128,
+        256
+      ],
+      "enabled": false,
+      "note": "三并行×MTP 对照图 · tp acc3.5 (背景, 见 CLAUDE.md「三并行对比」)"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 6,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        128,
+        256
+      ],
+      "enabled": false,
+      "note": "三并行×MTP 对照图 · tp acc6"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dep",
+      "mtp_n": 1,
+      "mtp_acc": 2,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        128,
+        256
+      ],
+      "enabled": false,
+      "note": "三并行×MTP 对照图 · dep N1 acc2"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dep",
+      "mtp_n": 5,
+      "mtp_acc": 6,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        128,
+        256
+      ],
+      "enabled": false,
+      "note": "三并行×MTP 对照图 · dep N5 acc6"
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dep",
+      "mtp_n": 0,
+      "mtp_acc": 0,
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        128,
+        256,
+        1024
+      ],
+      "enabled": false,
+      "note": "三并行×MTP 对照图 · dep 无 spec"
     },
     {
       "backend": "sglang",
       "parallel": "tep",
       "mtp_n": 5,
       "mtp_acc": 6,
-      "enabled": true,
-      "batches": [1, 4, 16, 64, 128, 256],
-      "note": ""
+      "batches": [
+        1,
+        4,
+        16,
+        64,
+        128
+      ],
+      "enabled": false,
+      "note": "三并行×MTP 对照图 · tep (batches 最高只能到 128, 原因见 CLAUDE.md TODO 的 tep 条)"
     },
-
-
-
-
-
-
-
-
     {
       "backend": "vllm",
       "parallel": "tp",
       "mtp_n": 5,
       "mtp_acc": 3.5,
       "enabled": false,
-      "note": "暂缓: 待 sglang 三档复现定稿后按同口径重跑"
+      "note": "暂缓 (见 CLAUDE.md TODO「暂缓」)"
     },
     {
       "backend": "vllm",
@@ -195,7 +627,7 @@
       "mtp_n": 1,
       "mtp_acc": 2,
       "enabled": false,
-      "note": "暂缓。另: batch>=128 有 decode 吞吐悬崖待查"
+      "note": "暂缓 (见 CLAUDE.md TODO「暂缓」)"
     },
     {
       "backend": "tokenspeed",
@@ -203,7 +635,7 @@
       "mtp_n": 5,
       "mtp_acc": 3.5,
       "enabled": false,
-      "note": "暂缓, 且只能在 node074/073 跑(node071 8-way 多播对称内存死锁)。dep 有 smg 网关 gRPC 并发 bug(c>=8 全崩), 故 tokenspeed 只有 tep 可用"
+      "note": "暂缓 (见 CLAUDE.md TODO「暂缓」)"
     }
   ]
 }

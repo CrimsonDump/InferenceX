@@ -1,3 +1,7 @@
 **/__pycache__/**
 **/.coverage
 experimental/multiturn/vllm_benchmark/results/
+
+# 跑出来的结果不入库(runners/<quant>/<图名>/ 下的 json/csv/svg/html/serverlog/cmd);
+# 各 quant 目录里的 config.json 是配置、要入库, 它不在这条 dir 规则的范围内。
+runners/*/*/

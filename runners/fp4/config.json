@@ -1,0 +1,176 @@
+{
+  "_readme": {
+    "本文件": [
+      "bench.sh 的唯一配置入口: bash runners/bench.sh [--config 本文件]。临时试跑就复制一份改完用",
+      "--config 指过去 —— 配置文件本身就是配置的单位, 所以 bench.sh 没有任何配置类命令行开关。",
+      "★只有 defaults / backends / curves 三个键会影响运行★; 以 _ 开头的键 loader 一律忽略。",
+      "唯一例外: curves[].note 会被读取(进 run_config.json 与报告的曲线表), 只写一行标签。",
+      "字段名写错 -> loader 直接报错; 一等字段与 env 里同名变量双写 -> 也直接报错。",
+      "本文件只放【字段是什么】; 当前在跑什么、结果如何、踩过什么坑 -> 看 CLAUDE.md。"
+    ],
+    "命名三层(各层只放本层内统一的字段, 详见 CLAUDE.md「产物与命名」)": [
+      "图   = <model>_<quant>_i<ISL>o<OSL>_c<最小>-<最大>.html (+ 同名目录), 出自 defaults",
+      "曲线 = series, 由 curve 字段推导: <backend>-<commit>-<parallel>-mtpN<N>A<acc>",
+      "       (mtp_n<=0 时 = mtpoff), 进结果文件名与图例 —— 曲线没有手写 id",
+      "点   = concurrency(batch), 只在结果文件名的 _c<b> 段, 是曲线的横轴",
+      "所以 backend/commit/parallel/MTP 不进图名(它们逐曲线变), 一张图里可以同时有多 backend、",
+      "多 commit 的曲线。构建按 (backend, commit) 去重, 同组合只准备一次源码树。"
+    ],
+    "defaults 字段": {
+      "model": "主模型权重目录(容器内可见)。图名的 model/quant 从这个目录名拆出来。指本地 tmpfs 比共享盘快 3 倍(只影响起服务耗时, 不影响测量口径)",
+      "mtp_draft_path": "EAGLE/MTP draft 目录(与 model 同一存储)。本地 checkpoint 的 MTP 层单独放, 必须显式给",
+      "seqlens": "ISL 列表(进图名)。多个值 = 多组 run, 图名里用 + 连",
+      "batches": "并发(concurrency)列表 = 曲线的横轴采样点。curves[].batches 可覆盖",
+      "osl": "输出长度(进图名)",
+      "reps": "每个点重复次数, 全部原始 JSON 都留。=1 时图上无误差棒, 想要 min-max 须线改成 3",
+      "gpu_count": "GPU 数, 同时是并行预设里的 world size; 也是每卡吞吐的除数(传给 client 的 --gpu-count)",
+      "metric_mode": [
+        "★全局测量口径★ = 曲线两个轴怎么算, 两个取值:",
+        "  steady-decode  刨 prefill: 取 max-TTFT 稳态窗口(窗内物理上无 prefill forward)。UTPS =",
+        "                 各请求窗内速率中位数; STPS/gpu = 窗内 decode token/窗长/gpu(只有 output",
+        "                 token)。窗口空的点判 ERR 排除出曲线(高并发常触发)。",
+        "  whole-run      不刨 prefill: UTPS = 1000/mean_TPOT(覆盖请求全程); STPS/gpu =",
+        "                 (ISL+OSL)×完成数/总时长/gpu【含 input token】。不需要窗口。",
+        "两套口径的原始量每个结果 JSON 里都有(客户端无条件都算), 本字段只决定报告端画哪套 —— 换",
+        "口径【不用重跑】, 改完直接跑 aggregate_and_plot.py。跨口径的数不可比, 故它是全局的。",
+        "MFU/MBU 不随本字段变: 恒按稳态 decode 的 step 时长算(decode step 的物理量), 所以稳态窗口",
+        "无效的点这两列留空, 即使该点在 whole-run 下有 UTPS/STPS。"
+      ],
+      "num_warmups": "client 正式测点前的 warmup 请求数(0=关)",
+      "quantization": "= --quantization。不给 = 让引擎按权重目录的 quantization_config 自动识别(fp8 权重就这样)。modelopt 导出的 NVFP4 权重自动识别不到那条 kernel 路径, 必须显式给 modelopt_fp4",
+      "arch_base": "architectures 旁路目录的落点(须可写)。权重在只读区时必须给, 见 glm52_arch_bypass.sh",
+      "outroot": "输出根目录; 实际 outdir = <outroot>/<图名去掉 .html>",
+      "outdir": "可选。显式指定输出目录(跳过自动命名), 用于让两次 run 的结果并存(否则同图名的旧结果会被移进 _prev_<时间戳>/)",
+      "src_cache": "build from source 的源码树缓存根: <src_cache>/<backend>-<commit>/",
+      "fetch_proxy": "取源码 tarball 用的代理。经代理下大文件会偶发截断, bench.sh 会校验 tar 并重下",
+      "env": "追加给所有曲线容器的环境变量 —— 只该放调试/逃生阀(AR_FUSION / ARCH_RENAME / SERVER_WARMUP / FLUSH_CACHE / WATCHDOG_TIMEOUT / SGLANG_ENABLE_JIT_DEEPGEMM / VLLM_ALLREDUCE_USE_SYMM_MEM 之类)。常用量都有一等字段, 别往这里塞(KV_CACHE_DTYPE 已升为 curve 的 kv_cache_dtype 字段, 两处都写会直接报错); curves[].env 覆盖同名键"
+    },
+    "backends 字段": {
+      "image": "容器镜像。commit 非 null 时它只是运行时基座(CUDA/torch/flashinfer/deepep/sgl-kernel/deep_gemm 等), 自带的引擎会被源码那份 editable 覆盖",
+      "repo": "build from source 的 git 仓库(bench.sh 从 codeload 取该 commit 的 tarball, 不是 clone)",
+      "commit": "该 backend 的默认 revision。null = 不从源码构建、用镜像自带版本(此时 series 名里的 commit 位由镜像探测: 安装目录 git hash -> 镜像 tag 尾部 hash -> 模块版本 -> tag)",
+      "作用域": "这里的 image/commit 只是默认值, 单条 curve 可各自覆盖 -> 同一张图里 A/B 两个版本"
+    },
+    "curves 字段": {
+      "backend": "选 backends 里的一项 -> 镜像/源码 + 容器内脚本。进 series 名",
+      "commit": "可选, 覆盖 backends.<backend>.commit; 进 series 名。同图 A/B 两个 commit 就靠它",
+      "image": "可选, 覆盖 backends.<backend>.image。★换 commit 常常得连镜像一起换★: sgl-kernel 与 deep_gemm 只在镜像里、又被源码硬性依赖, 所以 A/B 两臂各要配对自己的基座。同一 (backend, commit) 指两个不同 image 会报错(series 名里没有 image, 两条线会撞)",
+      "parallel": "tp=纯TP | dep=attn DP + MoE EP(deepep) | tep=attn TP + MoE EP | dpa-tp=attn DP + MoE TP。以 vllm 语义 world=tp*dp 为准, 由 bench.sh 翻译成各 backend 的 flag",
+      "mtp_n": "= --speculative-num-steps。<=0 = 不开 spec(series 记 mtpoff)。draft-tokens 不用填, sglang 默认 = steps+1",
+      "mtp_acc": "固定接受长度(sglang: SGLANG_SIMULATE_ACC_LEN + match-expected)。<=0 = 走自然接受。★UTPS 与它成正比★(N 固定时每 step 的算力/字节与接受几个 token 无关), 所以不同 acc 的曲线之间不能比引擎快慢",
+      "enabled": "false 则跳过(定义留着备查)",
+      "batches": "可选, 覆盖 defaults.batches",
+      "num_prompts": "可选, 逐点的 client --num-prompts, 必须与 batches 一一对应(它是【点】级的量)。不给 = num_prompts==并发 = 等长齐发一轮(本项目一直的口径)。★给成大于并发的值就是另一种发压方式★: 请求流水线补位, 稳态里始终有新请求在 prefill, TPOT/TTFT 统计构成不同, 与齐发一轮的数不可混比。cookbook 的 nvfp4 复现命令属于这一类(c=1 发 8 条 / c=16 发 64 条)",
+      "mem_frac": "= --mem-fraction-static。不给则脚本按并行猜(EP 0.80 / 非 EP 0.85)",
+      "chunked_prefill_size": "= --chunked-prefill-size; \"off\" = 不下发该 flag(走 sglang 默认, B200 上 16384); 不给则脚本用 32768。注意开 dp-attention 时 sglang 会把它强制夹到 4096",
+      "max_running_requests": "= --max-running-requests。★我们自己的曲线不要给★: 不给时 bench.sh 用本曲线最大并发, 即 max-running == 并发、不排队; 给小于并发的值就是人为制造排队。\"off\" = 不下发, 交给 sglang 自己按显存/上下文推",
+      "context_length": "= --context-length, 不给则 16384; \"off\" = 不下发(此时按权重的 max_position 算 KV 池/并发上限, GLM-5.2 是 1M)",
+      "cuda_graph_max_bs": "= --cuda-graph-max-bs, 不给则用本曲线最大并发(不设时 sglang 默认 ~160, 超过它的并发退 eager 会明显变慢); \"off\" = 不下发。注意 deepep 的 num_max_dispatch 也按它推算",
+      "kv_cache_dtype": "= --kv-cache-dtype。★取值是各 backend 原生的名字, 不通用★(vllm: fp8_e4m3 | tokenspeed: fp8 | sglang: fp8_e4m3/bfloat16), 所以跨 backend 同图时【别写在 defaults 级】, 要写就逐曲线写。不给时各 backend 取自己的正确默认: vllm fp8_e4m3(★官方 recipe 有这个 flag, 漏给就是 auto=bf16 -> KV 字节翻倍且 KV 池减半, 曾是三 backend 对比失真的最大单一原因★) / tokenspeed fp8 / sglang 不下发(让 DSA 自动配置选 fp8_e4m3)。\"off\" = 不下发该 flag",
+      "all2all_backend": "= MoE all-to-all 后端(vllm --all2all-backend / sglang --moe-a2a-backend), 只在 EP 曲线(dep/tep)生效。★取值同样是各 backend 原生的名字★(vllm: deepep_low_latency/deepep_high_throughput/allgather_reducescatter/... | sglang: deepep)。不给则都用 deepep 系(vllm deepep_low_latency, sglang deepep) = dep/tep 预设本来的定义; 选 low_latency 而非 high_throughput 是因为这是 decode benchmark。\"off\" = 不下发(vllm 会退回默认的 naive allgather_reducescatter)",
+      "attention_backend": "= vllm --attention-backend (目前只有 vllm 侧实现; sglang 的注意力后端由 DSA 自动配置推, 不用这个字段)。不给 = 走引擎自动选择(Blackwell 上 vllm 自动选 FLASHINFER_MLA_SPARSE)。★存在的理由★: FLASHMLA_SPARSE 不在自动候选里、必须显式点名, 它换的是 KV 布局(DeepSeek fp8_ds_mla 打包格式)与 decode kernel, 是要 A/B 的量; 且 0.26.0 已无 VLLM_ATTENTION_BACKEND 环境变量, 只能走 CLI。\"off\"/\"auto\" = 不下发",
+      "env": "可选, 该曲线容器的额外环境变量(调试/逃生阀), 覆盖 defaults.env 同名键",
+      "note": "★唯一会被读取的说明字段★: 进 run_config.json 与报告的曲线表。只写一行标签"
+    }
+  },
+  "defaults": {
+    "model": "/tilert/xbj/models/GLM-5.2-NVFP4",
+    "mtp_draft_path": "/tilert/xbj/models/GLM-5.2-NVFP4",
+    "quantization": "modelopt_fp4",
+    "seqlens": [
+      8192
+    ],
+    "batches": [
+      1,
+      4,
+      16,
+      64,
+      256
+    ],
+    "osl": 1024,
+    "reps": 1,
+    "gpu_count": 8,
+    "metric_mode": "whole-run",
+    "num_warmups": 64,
+    "outroot": "/tilert/xbj/tps_bench/InferenceX/runners/fp4",
+    "src_cache": "/tilert/xbj/src_cache",
+    "fetch_proxy": "http://10.26.5.219:3128",
+    "env": {}
+  },
+  "backends": {
+    "sglang": {
+      "image": "lmsysorg/sglang:latest",
+      "repo": "https://github.com/sgl-project/sglang",
+      "commit": "fdebc938"
+    },
+    "vllm": {
+      "image": "vllm/vllm-openai:v0.26.0",
+      "repo": "https://github.com/vllm-project/vllm",
+      "commit": null
+    },
+    "tokenspeed": {
+      "image": "local/tokenspeed-root:0.1.0",
+      "repo": "https://github.com/lightseekorg/tokenspeed",
+      "commit": null
+    }
+  },
+  "curves": [
+    {
+      "backend": "sglang",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 5,
+      "mem_frac": 0.85,
+      "chunked_prefill_size": 8192,
+      "context_length": "off",
+      "cuda_graph_max_bs": 64,
+      "enabled": true,
+      "note": ""
+    },
+    {
+      "backend": "sglang",
+      "parallel": "dpa-tp",
+      "mtp_n": 5,
+      "mtp_acc": 5,
+      "mem_frac": 0.92,
+      "chunked_prefill_size": 32768,
+      "context_length": "off",
+      "cuda_graph_max_bs": "off",
+      "enabled": true,
+      "note": ""
+    },
+    {
+      "backend": "vllm",
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 5,
+      "cudagraph_mode": "FULL_DECODE_ONLY",
+      "env": {
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_ENGINE_READY_TIMEOUT_S": "1800"
+      },
+      "enabled": true,
+      "note": ""
+    },
+    {
+      "backend": "tokenspeed",
+      "quantization": "nvfp4",
+      "moe_backend": "auto",
+      "enabled": true,
+      "parallel": "tp",
+      "mtp_n": 5,
+      "mtp_acc": 5,
+      "note": ""
+    },
+    {
+      "backend": "tokenspeed",
+      "quantization": "nvfp4",
+      "moe_backend": "auto",
+      "enabled": true,
+      "parallel": "dpa-tp",
+      "mtp_n": 5,
+      "mtp_acc": 5,
+      "note": ""
+    }
+  ]
+}

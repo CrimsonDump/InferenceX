@@ -145,16 +145,17 @@ for ln in lines:
         method = (
             f"{indent}def _apply_simulate_acc_len(self, accept_lengths):\n"
             f"{indent}    # 固定 MTP accept_len 的 hack (等价 sglang SGLANG_SIMULATE_ACC_LEN /\n"
-            f"{indent}    # vllm synthetic_acceptance_length): 每 decode step 提交恰好 K 个 token\n"
-            f"{indent}    # (含 bonus, 与那两家口径一致), E[K] = TS_SIMULATE_ACC_LEN, 上限是候选\n"
-            f"{indent}    # 宽度 spec_num_tokens。in-place: drafter 读同一 buffer 定下一 block 大小.\n"
+            f"{indent}    # vllm synthetic_acceptance_length): 每 decode step 强制恰好接受 K 个\n"
+            f"{indent}    # (K = min(TS_SIMULATE_ACC_LEN, spec_num_tokens), clamp 到候选宽度内).\n"
+            f"{indent}    # in-place: drafter 读同一 buffer 定下一 block 大小 (见 _cap_accept 注释).\n"
             f"{indent}    #\n"
             f"{indent}    # ★★ 本函数是在 cuda graph 【捕获期】执行的 (torch.cuda.graph(...) 内),\n"
             f"{indent}    # replay 时 python 完全不跑 —— 所以只能用 device 侧算子, 且严禁任何\n"
-            f"{indent}    # .item()/同步 ★★  踩过的两个坑(2026-07-30):\n"
+            f"{indent}    # .item()/同步 ★★  (fp8 那边踩过, 见 pitfalls/tokenspeed.md 第 2 条):\n"
             f"{indent}    #   1) 用 python 的 random 抽 k 再 fill_(k): 被当成【常量 fill】捕获进图,\n"
-            f"{indent}    #      每个 bs 桶的 k 就此永久冻结 -> 日志 avg_accept_len 恒为 3.00/4.00,\n"
-            f"{indent}    #      客户端实测每 step 只有 ~3.0 个 token, 永远打不到 3.5。\n"
+            f"{indent}    #      每个 bs 桶的 k 就此永久冻结 -> 非整数 acc 永远打不到目标值,\n"
+            f"{indent}    #      UTPS 系统性偏低 ~15% 且【无任何报错】. 整数 acc(如 5) 恰好无害,\n"
+            f"{indent}    #      所以这个 bug 在 acc=5 的 fp4 曲线上藏了很久。\n"
             f"{indent}    #   2) 调 .item() 看中间值: 捕获期同步 -> 进程当场 abort\n"
             f"{indent}    #      (captures_underway.empty() INTERNAL ASSERT FAILED)。\n"
             f"{indent}    # torch.rand 落在捕获的图里是安全的: torch.cuda.graph 会注册 generator\n"
@@ -171,7 +172,7 @@ for ln in lines:
             f"{indent}    if _w > 0:\n"
             f"{indent}        _a = min(_a, float(_w))\n"
             f"{indent}    # 小数(cookbook low-latency 的 3.5)按 lower/upper 伯努利抽, 期望恰为该值\n"
-            f"{indent}    # —— 与 sglang match-expected / vllm 的 min-variance schedule 同分布.\n"
+            f"{indent}    # —— 与 sglang match-expected / vllm 的 synthetic 接受率同分布.\n"
             f"{indent}    _lo = int(_math.floor(_a)); _hi = _lo + 1 if _lo < _a else _lo\n"
             f"{indent}    _p = _a - _lo\n"
             f"{indent}    if _os.environ.get('TS_ACC_DEBUG'):\n"
@@ -286,12 +287,24 @@ if [[ "$MTP" == "1" ]]; then
     echo "draft 的 +NextN 由 get_config(is_draft_worker) 自动补"
 fi
 
+# 量化方式(= defaults.quantization -> QUANTIZATION). tokenspeed 的 --quantization 枚举里有
+# nvfp4; 不给则让它按权重目录的 quantization_config 自动识别(fp8 权重就这样).
+# 注: tokenspeed 把 draft 的量化【单独】管 —— --speculative-draft-model-quantization 默认
+# "unquant"(转成 None), 正好对上 nvidia/GLM-5.2-NVFP4 的 layer 78 是 BF16 这一事实
+# (vllm 那边就是因为把全局 moe_backend 套到未量化的 draft 上, flashinfer_cutedsl 直接起不来).
+QUANT_ARGS=()
+if [[ -n "${QUANTIZATION:-}" ]]; then
+    QUANT_ARGS=( --quantization "$QUANTIZATION" )
+    echo "显式 --quantization $QUANTIZATION"
+fi
+
 # ====== ts serve 参数 ======
 # model id = $MODEL 路径 (served_model_name 默认=model), 与 client --model "$MODEL" 对齐.
 SERVER_ARGS=(
     serve
     --model "$MODEL"
     --trust-remote-code
+    ${QUANT_ARGS[@]+"${QUANT_ARGS[@]}"}
     --host 0.0.0.0 --port "$PORT"
     --max-model-len "$CONTEXT_LEN"
     --chunked-prefill-size "$CHUNKED_PREFILL"
@@ -306,6 +319,38 @@ SERVER_ARGS=(
     # 注意与 --enable-metrics 无关: 网关无条件起这个 server, 关 metrics 也躲不开。
     # 本 bench 同一时刻只有一个 server, 且没人 scrape 这个端口(不会产生 TIME_WAIT), 故固定安全。
     --prometheus-port "${PROM_PORT:-$((PORT + 2000))}"
+    # ★钉死 KVStore 的 host 池大小★(踩过, 2026-07-30, fp4 + 0.1.0): **`--disable-kvstore` 挡不住
+    # host 池的分配** —— 日志里 `enable_kvstore=False`/`disable_kvstore=True` 照样走
+    # MemoryExecutor.__init__ 建 host_pool. 而 `kvstore_size=0`(默认) 时按 `kvstore_ratio=2.0`
+    # 自动定尺寸: DSA 每 token 55,224 B × (设备池 1,882,112 tok × 2.0) => **138 GB/rank**.
+    # 自动定尺寸带 cgroup/可用内存的封顶(_auto_capped_host_size_tokens), 但 **per_rank_budget =
+    # 可用内存 / nprocs_per_node 是各 rank 各自采样的** —— 8 个 rank 同时按"当时"的可用内存算,
+    # 谁也不知道另外 7 个刚要吃掉多少, 于是 8×138 GB 把 host RAM 榨干, 紧随其后的 draft L2 池
+    # (只要 1.77 GB)必崩: `ValueError: Not enough host memory available. Requesting 1.77 GB but
+    # only have 0.62 GB free`. node076 上尤其容易撞: tmpfs(/mnt/ramweights 1.5T + /dev/shm 388G)
+    # 已占掉 1.8T/3T RAM, 只剩 ~1.1T, 正好卡在 8×138 GB 的边上(日志里 8 条 Capping 也没救回来).
+    # ★但不能砍到"够小"★(踩过, 同日): 这个池不只是 L2 前缀缓存, 还是**超容时的卸载目标** ——
+    # tokenspeed 处理"装不下"的方式是把被抢占请求的 KV 卸到 host 池(不是 sglang 的重算式 retract、
+    # 也不是 vllm 的排队). 池太小 -> `[Scheduler] Retract failed for request …: host capacity
+    # exhausted, aborting request` -> 请求被 abort、流断(Broken pipe) -> **我们的 client 收不到
+    # 终止事件, 永久挂住**(实测 tp c=256: 进度条停在 221/256 不动 29 分钟, 服务端 GPU 0%).
+    # 定尺寸的依据 = 超容缺口: c 并发 × (ISL+OSL) - 设备池 tokens, 再 × 每 token 字节.
+    #   实测 tp/ISL8192/OSL1024: c=256 需 2,359,296 tok/rank, 设备池 1,882,112 -> 缺口 26.4 GB/rank.
+    # 48 GB/rank 给了 ~1.8× 余量, 8×48=384 GB, host RAM(~1 TB 可用)放得下, 也仍远小于自动的 138 GB。
+    # `--kvstore-size` 是 GB, 显式给了就覆盖 kvstore_ratio, 绕开上面那套逐 rank 自动定尺寸。
+    # ⚠ 口径提醒: 到了要卸载的并发档(tp c=256), 该点的 TPOT 里就含 host<->device 拷贝, 与 sglang
+    #   (重算)/vllm(排队)的超容行为不同 —— 三家在那一格比的是"超容策略", 不是纯 decode 速度。
+    --kvstore-size "${KVSTORE_SIZE_GB:-48}"
+    # ★权重加载: 必开 prefetch, 否则在共享盘上慢 10 倍★(实测 2026-07-30, node076 + CephFS):
+    # tokenspeed 用 mmap 读 safetensors(8 个 rank 的 rchar 各只 1 GiB, 字节全靠 page fault 进来),
+    # 于是 8 个 rank 各自去 fault 全部 47 个 shard 里属于自己的【跨步切片】 -> 共享盘上退化成大量
+    # 小的随机网络读, 同一段字节还被多个 rank 反复读. 实测同一份 433 GB nvfp4 权重:
+    #   vllm(显式顺序读整文件再切片) 134 s (~3.2 GB/s)  vs  tokenspeed 默认 **24 分 20 秒**.
+    # 这个 flag 让 8 个本地 rank 把 shard 列表分掉(sorted_files[rank::world_size], 各约 6 个),
+    # 每 rank 起 N 个线程【顺序整文件】读进 OS page cache, 之后 mmap fault 全部命中内存.
+    # 默认 False, 所以不给就一直付那 24 分钟(一次 run 两条曲线 = 白等近 1 小时).
+    --weight-loader-prefetch-checkpoints
+    --weight-loader-prefetch-num-threads "${WEIGHT_PREFETCH_THREADS:-8}"
     --disable-kvstore              # 关 host-offload L2 KV cache: bench 不需要; 省 host 内存池(tep KVStore 分配曾崩); recipe(V4/Inkling)亦用
     --disable-prefill-graph        # 关 prefill CUDA graph: tep(attn-TP) 的 GLM DSA prefill graph 有 "token count mismatch" bug; 走 eager prefill 绕开. 对本 bench 无损(稳态窗口本就刨 prefill; decode 图仍用). recipe(MiniMax)亦用.
 )
@@ -340,17 +385,13 @@ fi
 if [[ "${EP:-0}" -ge 1 ]]; then
     # 专家并行: 每卡持完整专家, flashinfer_trtllm (recipe 默认).
     SERVER_ARGS+=( --enable-expert-parallel --moe-backend "${MOE_BACKEND:-flashinfer_trtllm}" )
-    # MoE all-to-all: ★env 名必须是 ALL2ALL_BACKEND★ —— 它是 config 里 curve 的
-    #   all2all_backend 字段经 bench.sh 注入的名字(sglang/vllm 两个脚本读的也是这个)。
-    #   早前这里写的是 A2A_BACKEND, 于是【config 里配了也静默无效】, tokenspeed 一直
-    #   吃 tokenspeed 自己的默认值 none, 而同图的 sglang dep 走 deepep、vllm dep 走
-    #   flashinfer_nvlink_two_sided —— 三条 dep 曲线实际用了三种 a2a, 变量没控住。
-    # 取值(tokenspeed 的 All2AllBackend 枚举, 与别家不通用): none | deepep |
-    #   flashinfer_nvlink_one_sided。none = 不做 a2a, 走 TritonRSAG 对称内存。
+    # MoE all-to-all: 默认 none(用 TritonRSAG 对称内存, 本机死锁); 可设 deepep 走 NVSHMEM
+    #   (本机 NVLink 已由 sglang 验证可用), 绕开对称内存 RSAG dispatch.
+    # ★env 名必须是 ALL2ALL_BACKEND★: 它是 config 里 curve 的 all2all_backend 字段, bench.sh
+    #   对三个 backend 统一注入这个名字. 早前这里写的是 A2A_BACKEND -> 【config 配了也静默无效】
+    #   (见 pitfalls/tokenspeed.md 第 3 条, fp8 脚本已改, 这里同步). "off" = 不下发.
     if [[ -n "${ALL2ALL_BACKEND:-}" && "${ALL2ALL_BACKEND}" != "off" ]]; then
         SERVER_ARGS+=( --all2all-backend "$ALL2ALL_BACKEND" )
-        # deepep 的 normal/low_latency 选择: 不给则 tokenspeed 默认 auto
-        # (decode 用 low_latency / prefill 用 normal), 正是 decode benchmark 想要的。
         [[ -n "${DEEPEP_MODE:-}" ]] && SERVER_ARGS+=( --deepep-mode "$DEEPEP_MODE" )
     fi
 else
@@ -369,18 +410,19 @@ if [[ "$MTP" == "1" ]]; then
 fi
 
 # ====== 只给 server 进程的出网代理 (flashinfer trtllm-gen cubin 运行期下载) ======
-# ★踩过 (2026-07-30, tokenspeed 0.1.0)★: 0.1.0 的 MoE 走 flashinfer-python 的 trtllm-gen
-# batched GEMM, 其 cubin 不在 wheel 里, 是【首次用到时从 edge.urm.nvidia.com 下载】的
-# (旧 :glm-radix 用自带的 tokenspeed-trtllm-kernel, 完全离线, 故没这问题). 节点无外网时:
-#   flashinfer.jit: Downloading ...Bmm_E4m3_...sm100f.cubin: connect timeout
-#   RuntimeError: trtllm_batched_gemm_runner.cu:305: Error occurred when running GEMM!
-# -> engine worker 挂 -> smg 网关 gRPC "broken pipe" -> 客户端全部 500, completed=0
-# (0.01s 内 16/16 瞬拒, 症状看着像"客户端参数不对", 其实是 server 侧缺 kernel).
-# 该 host 经节点代理可达(实测 cubin URL 200). ★绝不设成容器级 HTTP_PROXY★: 那会把 client
-# 打向 0.0.0.0:$PORT 的压测请求也代理走(NO_PROXY 写 127.0.0.1/localhost 盖不住 0.0.0.0),
-# 整个 run 直接废掉 —— 已实测踩过一次. 所以只在 setsid 启 server 时用 env 注入。
-# 不同并发会选到不同 tile 配置的 kernel(= 不同 cubin), 所以整条 sweep 都要留着这条出网,
-# 不能只在第一个点预热一次。
+# ★踩过两次 (2026-07-30)★: tokenspeed 0.1.0 的 flashinfer-python 会把 trtllm-gen 的 cubin
+# 【运行期按需从 edge.urm.nvidia.com 下载】(旧 :glm-radix 用自带的 tokenspeed-trtllm-kernel,
+# 完全离线, 故没这问题). 无外网时 fp4 这边两条曲线各崩在一颗不同的 cubin 上:
+#   parallel=tp    : DSA decode 的 fmha —— flashinfer.jit: Downloading fmhaSm100fKernel_QkvE4m3...
+#                    -> RuntimeError: Failed to load cubin (崩在 cudagraph capture, server 起不来)
+#   parallel=dpa-tp: MoE 的 batched GEMM —— trtllm_batched_gemm_runner.cu:305
+#                    Error occurred when running GEMM! -> engine worker 挂 -> 网关 gRPC 断
+# 该 host 经节点代理可达. ★绝不设成容器级 HTTP_PROXY★: 那会把 client 打向 0.0.0.0:$PORT 的
+# 压测请求也代理走(NO_PROXY 写 127.0.0.1/localhost 盖不住 0.0.0.0), 整个 run 直接废掉。
+# 所以只在 setsid 启 server 时用 env 注入。不同并发会选到不同 tile 的 kernel(= 不同 cubin),
+# 故整条 sweep 都要留着这条出网, 不能只在第一个点预热一次。
+# 注: bench.sh 把 /mnt/ramweights/jitp/cache 挂成容器的 /root/.cache, 所以下过的 cubin 会
+#     持久留在宿主 cache 里, 后续 run 即便无代理也能命中。
 SERVER_PROXY_ENV=()
 if [[ -n "${SERVER_PROXY:-}" ]]; then
     SERVER_PROXY_ENV=( "HTTPS_PROXY=$SERVER_PROXY" "HTTP_PROXY=$SERVER_PROXY"
@@ -389,7 +431,7 @@ if [[ -n "${SERVER_PROXY:-}" ]]; then
                        "no_proxy=127.0.0.1,localhost,0.0.0.0,10.0.0.0/8" )
     echo "SERVER_PROXY=$SERVER_PROXY (只注入 server 进程, 供 flashinfer 下 cubin; client 不受影响)"
 else
-    echo "SERVER_PROXY 未设: 若 flashinfer 需要的 trtllm-gen cubin 不在 /root/.cache 里会下载失败 -> GEMM 崩"
+    echo "SERVER_PROXY 未设: 若 flashinfer 需要的 trtllm-gen cubin 不在 /root/.cache 里会下载失败 -> 起不来/GEMM 崩"
 fi
 
 # .cmd 文件 = 复现记录: 先列 server 进程读取但不在命令行的 env, 再列启服务命令.

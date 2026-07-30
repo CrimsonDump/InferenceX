@@ -28,6 +28,7 @@
     6.5-7 TB/s, 若按 achievable 报, MBU 要再乘 ~1.15。
 """
 import json
+from fnmatch import fnmatch
 import os
 
 # ---- 每卡峰值(dense). key 用小写设备名 ----
@@ -98,8 +99,35 @@ class Shape(object):
         self.idx_layers = sum(0 if _skips_topk(cfg, i) else 1
                               for i in range(self.n_layers))
 
+        # ---- 每参数字节数: 被量化的张量 vs 留在原 dtype 的张量(量化 ignore 列表) ----
+        # ★别用单一 w_bytes★(踩过, 2026-07-30, MBU 冲到 111% 才发现): 早前是一行
+        #     w_bytes = 1 if quant_method.startswith("fp8") else 2
+        # 而 nvfp4 权重的 `quant_method` 是 **"modelopt"**(4bit 只写在 config_groups 里:
+        # num_bits=4 / type=float / group_size=16 / targets=["Linear"]) -> 落进 else 被按
+        # bf16 记 -> MoE 字节高估 2/0.5625 = 3.56x -> MBU 越过 100%(物理不可能).
+        # 现在按 config 逐组判定, 所以 fp8 / nvfp4 / 未量化 都对, 换别的格式也不用改代码。
         qc = cfg.get("quantization_config") or {}
-        self.w_bytes = 1 if str(qc.get("quant_method", "")).startswith("fp8") else 2
+        _DT = {"float32": 4, "float": 4, "float16": 2, "bfloat16": 2,
+               "float8_e4m3fn": 1, "float8_e5m2": 1}
+        # 未被量化的张量: 走 checkpoint 的原始 dtype
+        self.w_unq = _DT.get(str(cfg.get("torch_dtype") or "bfloat16"), 2)
+        qm = str(qc.get("quant_method", ""))
+        cgroups = qc.get("config_groups") or {}
+        if qm.startswith("fp8"):
+            # HF fp8 block-scale: e4m3 权重 + 每 (blk×blk) 一个 fp32 scale(≈+0.02%)
+            _b = qc.get("weight_block_size") or [128, 128]
+            self.w_q = 1.0 + 4.0 / max(1, _b[0] * _b[-1])
+        elif cgroups:
+            # modelopt / compressed-tensors 风格: num_bits + 每 group 一个 fp8 scale
+            _w = ((list(cgroups.values())[0] or {}).get("weights") or {})
+            _nb = float(_w.get("num_bits") or 8)
+            _gs = float(_w.get("group_size") or 0)
+            self.w_q = _nb / 8.0 + (1.0 / _gs if _gs else 0.0)   # nvfp4(4,16) -> 0.5625
+        else:
+            self.w_q = self.w_unq                                 # 没量化
+        # 量化的 ignore 列表(三种写法都见过): 命中者留在原 dtype
+        self._ign = list(qc.get("ignore") or qc.get("modules_to_not_convert")
+                         or qc.get("exclude_modules") or [])
         blk = (qc.get("weight_block_size") or [128, 128])[0]
 
         # ---- 每层参数量 ----
@@ -116,19 +144,34 @@ class Shape(object):
         self.p_ehproj = h * 2 * h                            # MTP eh_proj
 
         # ---- 权重字节(全模型, 未分片) ----
-        wb, W2 = self.w_bytes, 2
-        self.b_attn = self.p_attn_l * self.n_layers * wb
-        self.b_idx = self.p_idx_l * self.idx_layers * wb
-        self.b_moe = self.p_exp * self.n_exp * self.n_moe_layers * wb
-        self.b_shared = self.p_exp * self.n_shared * self.n_moe_layers * wb
-        self.b_dense = self.p_dense_l * self.n_dense * wb
-        self.b_gate = self.p_gate_l * self.n_moe_layers * W2
-        self.b_lmhead = self.p_lmhead * W2
-        self.b_d_attn = self.p_attn_l * wb
-        self.b_d_idx = self.p_idx_l * wb
-        self.b_d_moe = self.p_exp * self.n_exp * wb
-        self.b_d_shared = self.p_exp * self.n_shared * wb
-        self.b_d_eh = self.p_ehproj * W2
+        # 逐组取字节数: 用该组的代表性模块名去撞量化 ignore 列表(nvfp4 那份就是逐层
+        # 列出 `…self_attn*` / `…mlp.shared_experts*` / `model.layers.0*` 的, 所以
+        # 必须用【具体层号】去匹配 —— MoE 层取第一个 MoE 层, dense 层取第 0 层).
+        _Lm, _Ld = self.n_dense, 0
+        wb_attn = self._wb("model.layers.%d.self_attn.q_a_proj" % _Lm)
+        wb_idx = self._wb("model.layers.%d.self_attn.indexer.wk" % _Lm)
+        wb_exp = self._wb("model.layers.%d.mlp.experts.0.gate_proj" % _Lm)
+        wb_sh = self._wb("model.layers.%d.mlp.shared_experts.gate_proj" % _Lm)
+        wb_dn = self._wb("model.layers.%d.mlp.gate_proj" % _Ld)
+        wb_gate = self._wb("model.layers.%d.mlp.gate" % _Lm)      # 路由门, 通常不量化
+        wb_lm = self._wb("lm_head")                               # 通常不量化
+        self.b_attn = self.p_attn_l * self.n_layers * wb_attn
+        self.b_idx = self.p_idx_l * self.idx_layers * wb_idx
+        self.b_moe = self.p_exp * self.n_exp * self.n_moe_layers * wb_exp
+        self.b_shared = self.p_exp * self.n_shared * self.n_moe_layers * wb_sh
+        self.b_dense = self.p_dense_l * self.n_dense * wb_dn
+        self.b_gate = self.p_gate_l * self.n_moe_layers * wb_gate
+        self.b_lmhead = self.p_lmhead * wb_lm
+        self.b_d_attn = self.p_attn_l * wb_attn
+        self.b_d_idx = self.p_idx_l * wb_idx
+        self.b_d_moe = self.p_exp * self.n_exp * wb_exp
+        self.b_d_shared = self.p_exp * self.n_shared * wb_sh
+        # 全模型参数量(与字节解耦: 混合精度下不能再拿 b_total/w_bytes 反推)
+        self.p_total = (self.p_attn_l * self.n_layers + self.p_idx_l * self.idx_layers
+                        + self.p_exp * (self.n_exp + self.n_shared) * self.n_moe_layers
+                        + self.p_dense_l * self.n_dense
+                        + self.p_gate_l * self.n_moe_layers + self.p_lmhead)
+        self.b_d_eh = self.p_ehproj * self._wb("model.layers.%d.eh_proj" % self.n_layers)
         self.b_total = (self.b_attn + self.b_idx + self.b_moe + self.b_shared
                         + self.b_dense + self.b_gate + self.b_lmhead)
 
@@ -156,10 +199,18 @@ class Shape(object):
         self.attn_coef_idx_l = 2 * self.idx_nh * self.idx_d
 
     # ------------------------------------------------------------------
+    def _wb(self, name):
+        """该模块每参数的字节数: 命中量化 ignore 列表就留在原 dtype, 否则按量化后的字节。"""
+        for pat in self._ign:
+            if fnmatch(name, pat) or name.startswith(pat):
+                return self.w_unq
+        return self.w_q
+
     def summary(self):
         return {
-            "总参数(B)": round(self.b_total / self.w_bytes / 1e9, 1),
+            "总参数(B)": round(self.p_total / 1e9, 1),
             "权重字节(GB)": round(self.b_total / 1e9, 1),
+            "每参数字节(量化/未量化)": "%.4f / %d" % (self.w_q, self.w_unq),
             "每token激活参数(B)": round(self.p_act_target / 1e9, 2),
             "MoE专家权重(GB)": round(self.b_moe / 1e9, 1),
             "带indexer的层": "%d / %d" % (self.idx_layers, self.n_layers),

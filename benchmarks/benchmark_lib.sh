@@ -19,9 +19,32 @@ export PORT="${PORT:-8888}"
 # 把一个环境变量以 "export VAR=值  # 说明" 格式输出到 stdout(仅当该变量已定义).
 # 供容器内脚本把"命令行之外"的所有环境变量(调优/hack/客户端参数)完整写进 .cmd 文件,
 # 每行一个、自带注释, 便于复现与报告展示. 未设置的变量自动跳过(不产生噪声行).
+# 记下已被 emit_env 点到名的变量(不论是否已设置), 供下面的 emit_cfg_env 去重.
+EMITTED_ENV_NAMES=" "
 emit_env() {
     local v="$1" c="$2"
+    EMITTED_ENV_NAMES+="$v "
     [[ -n "${!v+x}" ]] && printf 'export %s=%s  # %s\n' "$v" "${!v}" "$c"
+}
+
+# 把 config.json 的 env 块里注入、但上面 emit_env 白名单【没列到】的变量补进 .cmd.
+# ★为什么必须有这个兜底★(踩过): emit_env 是逐个变量名硬编码的, 而 config 的 env 块可以写任何
+# key —— 漏列的那个就【静默不进 .cmd】, 报告里的启服务命令看着像没开它, 而它其实生效了
+# (VLLM_USE_V2_MODEL_RUNNER 就是这么漏掉的, 只能去 serverlog 里找证据才确认得了).
+# 名单由 bench.sh 以 BENCH_CFG_ENV_KEYS 传入(空格分隔), 所以"config 里配了什么"与"·cmd 里
+# 记了什么"再也不会脱节. 注: 其中有的项是【本脚本自己消费的开关】(如 ARCH_RENAME/SERVER_WARMUP),
+# 并非 server 进程直接读取 —— 但它们同样改变了这次 run, 宁可如实列出也不要漏.
+emit_cfg_env() {
+    local k first=1
+    for k in ${BENCH_CFG_ENV_KEYS:-}; do
+        [[ "$EMITTED_ENV_NAMES" == *" $k "* ]] && continue   # 上面已带注释列过
+        [[ -n "${!k+x}" ]] || continue
+        if (( first )); then
+            echo "# --- config.json 的 env 块里其余项 (逃生阀/调试; 部分由容器内脚本消费) ---"
+            first=0
+        fi
+        printf 'export %s=%s  # 来自 config.json 的 env 块\n' "$k" "${!k}"
+    done
 }
 
 agentic_kv_offload_enabled() {
@@ -545,7 +568,9 @@ run_benchmark_serving() {
         "${profile_flag[@]}"
         "${flush_flag[@]}"
         --save-result
-        --num-warmups "${NUM_WARMUPS:-$((2 * max_concurrency))}" \
+        --num-warmups "${NUM_WARMUPS:-$((2 * max_concurrency))}"
+        # 每GPU吞吐要按真实卡数换算 (client 默认 8; bench.sh 把 defaults.gpu_count 传进来)
+        --gpu-count "${GPU_COUNT:-8}"
         --percentile-metrics 'ttft,tpot,itl,e2el'
         --result-dir "$result_dir"
         --result-filename "$result_filename.json"

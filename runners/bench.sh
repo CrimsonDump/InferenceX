@@ -3,10 +3,14 @@
 # bench.sh — GLM-5.2 多 backend (sglang / vllm / tokenspeed) 的
 #            每GPU吞吐(STPS) vs 交互速度(UTPS) 对比曲线.
 # ============================================================================
-# 在装了 8×B200 + docker 的节点上运行(当前 sglang 用 node074: node071 的多播/对称内存
-# rendezvous 在 8 卡下死锁, 见 CLAUDE.md). 一次 run 把 config.json 里所有 enabled 的曲线
+# 在装了 8×B200 + docker 的节点上运行(node071/073/074 均可; 跑前查占用与 NVLink, 见
+# CLAUDE.md). 一次 run 把 config.json 里所有 enabled 的曲线
 # 逐条跑完(每条曲线起一次容器), 结果全写同一 outdir, 最后聚合成【一个含所有曲线 +
-# 全部原始数据】的自包含 HTML 报告. 同一套口径: max-TTFT 稳态窗口 + 固定 MTP N/accept_len.
+# 全部原始数据】的自包含 HTML 报告. MTP 的 N/accept_len 逐曲线固定.
+#
+# 测量口径由 defaults.metric_mode 全局决定(steady-decode | whole-run), 见 config.json.
+# 它只影响【报告端怎么算两个轴】: 两套口径是同一批原始数据的两种事后算法, 都写进了每个点的
+# 结果 JSON, 所以换口径【不用重跑】—— 改 config 后直接重跑 aggregate_and_plot.py 即可.
 #
 # ---- 用法: 配置的唯一入口是 config.json, 本脚本【没有配置类命令行开关】 ----
 #   bash bench.sh                      # 用 runners/config.json
@@ -19,12 +23,16 @@
 #   复制一份 config.json 改完用 --config 指过去(配置文件本身就是配置的单位).
 #
 # ---- config.json 三层结构 (字段说明见 config.json 内的 _readme / _*_fields) ----
-#   defaults = 整次 run 共享的坐标轴与环境 (model / seqlens / batches / osl / reps /
-#              gpu_count / outroot|outdir / mtp_draft_path / src_cache / fetch_proxy / env)
+#   defaults = 整次 run 共享的坐标轴与口径 (model / seqlens / batches / osl / reps /
+#              gpu_count / metric_mode / num_warmups / arch_base / outroot|outdir /
+#              mtp_draft_path / src_cache / fetch_proxy / env)
 #   backends = 每个 backend 的构建来源默认值 (image / repo / commit)
 #              commit=null -> 不从源码构建, 用镜像自带引擎(commit 位由镜像探测填)
 #   curves   = 图上每条线: backend / parallel / mtp_n / mtp_acc (+ 可选 commit / batches /
-#              env / enabled / note). curve 内同名字段覆盖 defaults(仅 batches / env).
+#              mem_frac / chunked_prefill_size / max_running_requests / context_length /
+#              cuda_graph_max_bs / kv_cache_dtype / all2all_backend / env / enabled / note)
+#   一等字段 vs env: 常用的量都有【自己的字段】(上面那些), env 只留给调试/逃生阀(AR_FUSION /
+#              ARCH_RENAME / SERVER_WARMUP 之类). 同一项若字段与 env 两处都写 -> 直接报错.
 #
 # ---- 产物命名: 按"图 / 曲线 / 点"三层, 各层只放本层统一的字段 ----
 #   图 (= 一份报告/一个目录, 全图统一): <model>_<quant>_i<ISL>o<OSL>_c<最小>-<最大>.html
@@ -42,7 +50,8 @@
 #   目录: defaults.outdir 优先, 否则 <defaults.outroot>/<图名去掉 .html>
 #
 # 产物(在 outdir): <图名>.html / tps_curve.csv / tps_raw.csv / tps_curve_s<ISL>.svg /
-#   run_config.json(含 config.json 全文) / glm52_<series>_s<ISL>_c<b>_r<rep>.json /
+#   run_config.json(图级配置 + config 全文) / config.json(输入 config 的逐字副本, 可直接
+#   `--config` 指回来复现) / glm52_<series>_s<ISL>_c<b>_r<rep>.json /
 #   每曲线一个 glm52_<series>_s<ISL>.cmd (实际启服务命令 + 需 export 的环境变量)
 #
 # ---- build from source (config 里 commit 非 null 时) ----
@@ -71,7 +80,7 @@ done
 
 [[ -f "$CONFIG" ]] || { echo "错误: 找不到配置文件 $CONFIG" >&2; exit 1; }
 [[ -f "$AGG" ]] || { echo "错误: 找不到 $AGG" >&2; exit 1; }
-command -v docker >/dev/null || { echo "错误: 需要 docker (请在有 GPU 的节点上运行, 如 node074)" >&2; exit 1; }
+command -v docker >/dev/null || { echo "错误: 需要 docker (请在有 8×B200 的节点上运行, 如 node071)" >&2; exit 1; }
 
 # ============================ 读 config.json ============================
 # python 侧做全部解析与校验(未知字段直接报错, 免得配了个错别字被静默忽略),
@@ -79,7 +88,12 @@ command -v docker >/dev/null || { echo "错误: 需要 docker (请在有 GPU 的
 #   D <key> <value>                       defaults 标量(列表用逗号连)
 #   B <backend> <image> <repo> <commit>   用到的 backend (commit 为空 = 用镜像自带)
 #   C <idx> <backend> <parallel> <mtp_n> <mtp_acc> <batches> <commit> <note>
-#   E <idx|D> <KEY> <VALUE>               容器额外 env (idx=D 表示 defaults.env)
+#   E <idx|D> <KEY> <VALUE>               容器 env (idx=D 表示 defaults 层; curve 层覆盖之).
+#                                         来源: 一等字段(num_warmups/mem_frac/… 由 loader
+#                                         翻译成 env 名)与 env 块(调试/逃生阀)
+#   K <idx|D> <KEY,KEY,…>                 上面 E 里【出自 env 块】的那些 key 名(逗号分隔) ——
+#                                         传给容器内脚本, 让 .cmd 能把它们补全(见 loader 里
+#                                         emit("K", …) 处的说明: 白名单漏项会让开关静默不入 .cmd)
 # 分隔符【不能用 tab】: tab 属于 IFS 空白字符, bash 的 read 会把连续 tab 折叠成一个分隔符,
 # 于是 commit 为空(用镜像自带引擎)时该字段被吞掉、后面的字段整体左移. \x1f 非空白, 空字段得以保留.
 CFG_TSV="$(python3 - "$CONFIG" <<'PY'
@@ -94,11 +108,60 @@ def die(msg):
     sys.exit(1)
 
 DEFAULT_KEYS = {"model", "mtp_draft_path", "seqlens", "batches", "osl", "reps",
-                "gpu_count", "outroot", "outdir", "src_cache", "fetch_proxy", "env"}
+                "gpu_count", "outroot", "outdir", "src_cache", "fetch_proxy",
+                "metric_mode", "num_warmups", "arch_base", "quantization", "env"}
 BACKEND_KEYS = {"image", "repo", "commit"}
-CURVE_KEYS = {"backend", "commit", "parallel", "mtp_n", "mtp_acc", "enabled",
-              "batches", "env", "note", "cookbook_ref"}
+CURVE_KEYS = {"backend", "commit", "image", "parallel", "mtp_n", "mtp_acc", "enabled",
+              "batches", "num_prompts", "mem_frac", "chunked_prefill_size",
+              "max_running_requests", "context_length", "cuda_graph_max_bs",
+              "kv_cache_dtype", "all2all_backend", "attention_backend",
+              "cudagraph_mode", "moe_backend", "max_num_batched_tokens",
+              "quantization", "env", "note"}
 PARALLELS = {"tp", "dep", "tep", "dpa-tp"}
+METRIC_MODES = {"steady-decode", "whole-run"}
+
+# 一等配置字段 -> 容器 env 名. 这些量【只该在 config 里以字段形式出现】, 不该让人往 env 里
+# 塞裸环境变量(env 只留给调试/逃生阀). 下面会检查同一项没有被字段与 env 两处同时写.
+DEFAULT_ENV_FIELDS = {"num_warmups": "NUM_WARMUPS", "arch_base": "ARCH_BASE",
+                      "quantization": "QUANTIZATION"}
+CURVE_ENV_FIELDS = {"num_prompts": "NUM_PROMPTS_LIST",
+                    # ★量化名逐 backend 不同★: sglang/vllm 要 "modelopt_fp4", tokenspeed 要
+                    # "nvfp4"(它的 --quantization 枚举是 fp8/mxfp4/nvfp4)。所以除了
+                    # defaults.quantization(整图默认), curve 也能覆盖 —— 否则同一张图里
+                    # 三个 backend 没法共用一个值(实测 tokenspeed 会 argparse invalid choice 直接退出)。
+                    "quantization": "QUANTIZATION",
+                    "mem_frac": "MEM_FRAC",
+                    "chunked_prefill_size": "CHUNKED_PREFILL_SIZE",
+                    "max_running_requests": "MAX_RUNNING_REQUESTS",
+                    "context_length": "CONTEXT_LENGTH",
+                    "cuda_graph_max_bs": "CUDA_GRAPH_MAX_BS",
+                    # KV dtype 是【一等字段】而不是逃生阀: 漏给它就是静默换口径 —— vllm 不给
+                    # 就默认 auto=bf16, KV 字节翻倍且 KV 池减半(实测 tp 池 742,528 tok 只装
+                    # ~80 条 9216-token 请求, c=256 在排队而非满并发), 而 sglang 走 DSA 自动
+                    # 选 fp8_e4m3 —— 两边根本不是同一配置却都"跑成功了", 事后极难发现.
+                    "kv_cache_dtype": "KV_CACHE_DTYPE",
+                    # MoE all-to-all 后端: parallel=dep/tep 的定义里本来就写着"MoE EP(deepep)",
+                    # 但 vllm 不给这个 flag 时默认 allgather_reducescatter(naive), 于是同一个
+                    # "dep" 在 sglang 是 deepep、在 vllm 是 naive —— 预设名与实际不符.
+                    "all2all_backend": "ALL2ALL_BACKEND",
+                    # 注意力后端. vllm 侧只能走 CLI(0.26.0 已无 VLLM_ATTENTION_BACKEND env),
+                    # 且 FLASHMLA_SPARSE 不在自动候选里、必须显式点名 —— 它换的是 KV 布局
+                    # (DeepSeek 的 fp8_ds_mla 打包格式)与 decode kernel, 属于要 A/B 的量.
+                    "attention_backend": "ATTENTION_BACKEND",
+                    # CUDA graph 捕获模式(vllm). 默认会同时捕 mixed prefill-decode(PIECEWISE)
+                    # 与 decode(FULL) 两套; 官方 GLM-5.2-NVFP4 的 decode 节点用 FULL_DECODE_ONLY,
+                    # 纯 decode benchmark 下更贴近它 —— 属于要 A/B 的量, 故做成一等字段.
+                    "cudagraph_mode": "CUDAGRAPH_MODE",
+                    # NvFp4 MoE kernel(vllm --kernel-config 的 moe_backend). auto 时 vllm 按
+                    # FLASHINFER_TRTLLM > CUTEDSL > CUTEDSL_BATCHED > CUTLASS ... 顺序挑第一个
+                    # 支持的; 小 batch 下未必最优, 属于要 A/B 的量.
+                    "moe_backend": "MOE_BACKEND",
+                    # vllm --max-num-batched-tokens: 每步 prefill token 预算. 官方 GLM-5.2-NVFP4
+                    # 博客的 decode 节点用 1024(它是 PD 分离, decode 侧几乎不跑 prefill).
+                    # ★注意这会改变被测量★: ISL8192 被切成更多 chunk -> TTFT 变差, 且 whole-run 的
+                    # mean_TPOT 里被 prefill 抢走的 step 结构也变 -> 与不设它的点不可逐格比.
+                    # 目前只有 fp4 版 vllm 脚本读它(fp8 那份未加, 给了会被静默忽略).
+                    "max_num_batched_tokens": "MAX_NUM_BATCHED_TOKENS"}
 
 # 允许 _ 开头的键作注释/文档(config.json 里的 _readme / _*_fields)
 top = {k: v for k, v in cfg.items() if not k.startswith("_")}
@@ -115,6 +178,17 @@ for req in ("model", "seqlens", "batches", "osl", "reps", "gpu_count"):
         die(f"defaults 缺字段 {req}")
 if "outroot" not in d and "outdir" not in d:
     die("defaults 需要 outroot 或 outdir 之一")
+# 口径是全局的(像 model 一样): 一张图的两个轴不能一半稳态一半全程
+metric_mode = d.get("metric_mode", "steady-decode")
+if metric_mode not in METRIC_MODES:
+    die(f"defaults.metric_mode={metric_mode!r} 非法 (只认 {sorted(METRIC_MODES)})")
+
+
+def check_env_collision(scope, envd, fields):
+    """同一项不许字段与 env 两处同时写 —— 否则"这次到底用了哪个值"又无从判断."""
+    for f, ev in fields.items():
+        if f in scope and ev in (envd or {}):
+            die(f"{f} 与 env.{ev} 只能写一处 (它们是同一项; env 只留给调试/逃生阀)")
 
 backends = {k: v for k, v in top.get("backends", {}).items() if not k.startswith("_")}
 for bk, bv in backends.items():
@@ -142,11 +216,23 @@ def join(v):
 for k in sorted(DEFAULT_KEYS - {"env"}):
     if k in d:
         emit("D", k, join(d[k]))
+emit("D", "metric_mode", metric_mode)          # 有默认值, 即使没写也要落下去
 
+# defaults 的一等字段 + env(调试用) -> 容器 env
+check_env_collision(d, d.get("env"), DEFAULT_ENV_FIELDS)
+for f, ev in DEFAULT_ENV_FIELDS.items():
+    if f in d:
+        emit("E", "D", ev, d[f])
 for k, v in (d.get("env") or {}).items():
     emit("E", "D", k, v)
+# ★K 记录 = 【env 块】里那些 key 的名单★(不含一等字段翻译出来的那些 —— 后者都会变成命令行
+# flag, 本来就看得见). 容器内脚本的 .cmd env 段是【硬编码白名单】, 只列它自己知道的变量名 ——
+# 于是 config 的 env 里配了个脚本没列的 key(踩过: VLLM_USE_V2_MODEL_RUNNER)就【静默不进 .cmd】,
+# 报告里的启服务命令看着像没开那个开关, 而它其实生效了(得去 serverlog 里找证据才能确认).
+# 把名单传进去, 脚本用 emit_cfg_env 补齐剩下的, 保证"config 里配的 env 一定出现在 .cmd 里".
+emit("K", "D", ",".join(sorted((d.get("env") or {}).keys())))
 
-used = []
+used = {}          # (backend, commit) -> image; 保持插入序
 for i, c in enumerate(curves):
     unknown = set(k for k in c if not k.startswith("_")) - CURVE_KEYS
     if unknown:
@@ -171,29 +257,55 @@ for i, c in enumerate(curves):
         die(f"curves[{i}].mtp_n={c['mtp_n']!r} 不是整数")
     if not isinstance(c["mtp_acc"], (int, float)) or isinstance(c["mtp_acc"], bool):
         die(f"curves[{i}].mtp_acc={c['mtp_acc']!r} 不是数")
+    # num_prompts: 逐点的 client --num-prompts, 必须与 batches 一一对应(它是【点】级的量,
+    # 不是曲线级的). 不给 = 沿用 num_prompts == 并发(等长齐发一轮). cookbook 的 nvfp4
+    # 复现命令里两者【不相等】(c=1 发 8 条 / c=16 发 64 条), 故必须能逐点指定.
+    if "num_prompts" in c:
+        np_ = c["num_prompts"]
+        if not isinstance(np_, list):
+            die(f"curves[{i}].num_prompts 必须是列表(与 batches 一一对应), 现在是 {np_!r}")
+        nb = len(c.get("batches", d["batches"]))
+        if len(np_) != nb:
+            die(f"curves[{i}].num_prompts 有 {len(np_)} 项, batches 有 {nb} 项 —— 必须一一对应")
+        for v in np_:
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                die(f"curves[{i}].num_prompts 里 {v!r} 不是正整数")
     emit("C", i, bk, c["parallel"], mtp_n, c["mtp_acc"], batches,
          commit, c.get("note", ""))
+    # 逐曲线的 server 旋钮(一等字段) + env(调试用) -> 容器 env, 覆盖 defaults 同名键
+    check_env_collision(c, c.get("env"), CURVE_ENV_FIELDS)
+    for f, ev in CURVE_ENV_FIELDS.items():
+        if f in c:
+            emit("E", i, ev, join(c[f]))
     for k, v in (c.get("env") or {}).items():
         emit("E", i, k, v)
+    emit("K", i, ",".join(sorted((c.get("env") or {}).keys())))   # 见上面 K 记录的说明
+    # 镜像默认取 backends.<bk>.image, curve 可覆盖 —— A/B 两个引擎版本各自要配对的基座
+    # (sgl-kernel 只存在于镜像里且被源码 pyproject 硬 pin, 见 CLAUDE.md), 所以"换 commit"
+    # 往往得连镜像一起换, 而两条曲线要进同一张图.
+    img = c.get("image", backends[bk].get("image"))
     key = (bk, commit)
-    if key not in used:
-        used.append(key)
+    if key in used and used[key] != img:
+        die(f"curves[{i}]: (backend={bk}, commit={commit or '镜像自带'}) 被指了两个不同的 image "
+            f"({used[key]} vs {img}) —— 同一 (backend, commit) 只能对一个镜像, 否则 series 名"
+            f"(不含 image)会撞车、图上两条线分不开")
+    used[key] = img
 
-for bk, commit in used:
-    b = backends[bk]
-    emit("B", bk, b["image"], b.get("repo") or "", commit)
+for (bk, commit), img in used.items():
+    emit("B", bk, img, backends[bk].get("repo") or "", commit)
 
 print("\n".join(out))
 PY
 )" || exit 1
 
 # ---- TSV -> bash 变量/数组 ----
-declare -A DEF=() BK_IMAGE=() BK_REPO=() BK_CFG_COMMIT=() CURVE_ENV=()
+declare -A DEF=() BK_IMAGE=() BK_REPO=() BK_CFG_COMMIT=() CURVE_ENV=() CFG_ENV_KEYS=()
 CURVE_LINES=(); BK_LIST=()
 while IFS=$'\x1f' read -r kind f2 f3 f4 f5 f6 f7 f8 f9; do
   case "$kind" in
     D) DEF["$f2"]="$f3";;
     E) CURVE_ENV["$f2|$f3"]="$f4";;
+    K) CFG_ENV_KEYS["$f2"]="$f3";;
     C) CURVE_LINES+=("$f2"$'\x1f'"$f3"$'\x1f'"$f4"$'\x1f'"$f5"$'\x1f'"$f6"$'\x1f'"$f7"$'\x1f'"$f8"$'\x1f'"$f9");;
     B) BK_LIST+=("$f2"$'\x1f'"$f5"); BK_IMAGE["$f2|$f5"]="$f3"; BK_REPO["$f2"]="$f4";;
   esac
@@ -205,6 +317,16 @@ SEQLENS="${DEF[seqlens]}"
 BATCHES_DEF="${DEF[batches]}"
 OSL="${DEF[osl]}"
 REPS="${DEF[reps]}"
+# 测量口径(全局, 见 config.json 的 defaults.metric_mode): 只影响【报告端】怎么算两个轴,
+# 不影响怎么跑 —— 两套口径是同一批原始数据的两种事后算法, 都在结果 JSON 里.
+METRIC_MODE="${DEF[metric_mode]}"
+# 措辞的单一真相源在 aggregate_and_plot.py::metric_desc() —— 报告里那一行由它生成;
+# 这里这份只进 run_config.json 与控制台日志, 改口径时两处要一起改.
+if [[ "$METRIC_MODE" == "whole-run" ]]; then
+  METRIC_DESC="whole-run: UTPS=interactivity=1000/TPOT_P50, STPS/gpu=每GPU吞吐=(ISL+OSL)×完成数/总时长/gpu, 包含 prefill 【含 input token】 —— 即 sglang cookbook 表的两列口径"
+else
+  METRIC_DESC="steady-decode: UTPS=interactivity=各请求稳态窗内速率的中位数, STPS/gpu=每GPU吞吐=窗内 decode token/窗长/gpu, 不包含 prefill (max-TTFT 稳态窗口)"
+fi
 GPU_COUNT="${DEF[gpu_count]}"
 OUTROOT="${DEF[outroot]:-}"
 OUTDIR="${DEF[outdir]:-}"
@@ -232,6 +354,13 @@ parallel_canonical() {   # $1=parallel 名 -> 设 P_TP/P_DP/P_EP
 }
 
 sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9.+' '-'; }
+
+# 容器名的字符集比 series 名【更窄】: docker 只认 [a-zA-Z0-9][a-zA-Z0-9_.-], 不允许 '+'。
+# 而 series 名刻意允许 '+'(为版本号型 commit 留的, 如 vllm 的 v0.1.dev17670+g7d24aa6f2), 直接
+# 拿 series 拼容器名会被 docker 拒: "Invalid container name … only [a-zA-Z0-9][a-zA-Z0-9_.-]"
+# —— 踩过: vllm 三条曲线因此在 docker run 阶段全灭, 连容器都没起来(极易误判成"vllm 跑不起来")。
+# 故容器名单独净化, series 名保持原样(它要进结果文件名, 聚合脚本按该字符集解析)。
+docker_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-'; }
 
 # ============================ commit / 镜像 / 源码树 ============================
 # commit 进 series 名(属曲线, 不属图 —— 同一张图允许不同 backend/commit 的曲线).
@@ -310,13 +439,16 @@ done
 # model / quant: 从 defaults.model 的权重目录名拆 (…/glm-5p2-fp8/model -> glm-5p2 + fp8)
 _wdir="$(basename "${MODEL%/}")"
 [[ "$_wdir" == "model" || "$_wdir" == "weights" ]] && _wdir="$(basename "$(dirname "${MODEL%/}")")"
-case "$_wdir" in
+# 量化后缀【大小写不敏感】: 权重目录常见大写(如 nvidia 官方那份就叫 GLM-5.2-NVFP4),
+# 若按原样匹配会落到 QUANT=unk, 图名变成 "..._unk_..." —— 名字里丢掉量化是最不该出的错.
+_wdir_lc="$(printf '%s' "$_wdir" | tr 'A-Z' 'a-z')"
+case "$_wdir_lc" in
   *-nvfp4) QUANT=nvfp4;; *-mxfp4) QUANT=mxfp4;; *-fp4) QUANT=fp4;;
   *-fp8)   QUANT=fp8;;   *-bf16)  QUANT=bf16;;  *-fp16) QUANT=fp16;;
   *-int8|*-w8a8|*-awq|*-gptq) QUANT="${_wdir##*-}";;
   *) QUANT=unk;;
 esac
-MODEL_NAME="$_wdir"; [[ "$QUANT" != "unk" ]] && MODEL_NAME="${_wdir%-$QUANT}"
+MODEL_NAME="$_wdir_lc"; [[ "$QUANT" != "unk" ]] && MODEL_NAME="${_wdir_lc%-$QUANT}"
 
 # 并发范围取【全部曲线】并发取值的并集 min-max: 逐曲线可有自己的 batches(如 tep 有硬上限),
 # 但图名是全图统一的, 只记这张图扫到的范围, 便于区分"扫到 256"与"只扫到 64"两张图.
@@ -341,8 +473,12 @@ if [[ "$DRY_RUN" != "1" ]]; then
   # 隔离本次运行: 旧结果移入 _prev_<时间戳>/ (一次, 对全部曲线)
   if ls "$OUTDIR"/glm52_*_c*.json >/dev/null 2>&1 || ls "$OUTDIR"/tps_curve.csv >/dev/null 2>&1; then
     PREV="$OUTDIR/_prev_$(date +%Y%m%d_%H%M%S)"; mkdir -p "$PREV"
-    mv -f "$OUTDIR"/glm52_*_c*.json "$OUTDIR"/glm52_*.cmd "$OUTDIR"/tps_curve.csv "$OUTDIR"/tps_raw.csv \
-          "$OUTDIR"/tps_curve_s*.svg "$OUTDIR"/*.html "$PREV/" 2>/dev/null || true
+    # ★.serverlog / .gpu_metrics.csv 也要一起搬★: 它们是这批结果的证据(retract / #cached-token /
+    # token usage), 留在原地会被下一轮同名 series 覆盖 —— 数据搬走了、证据却丢了.
+    mv -f "$OUTDIR"/glm52_*_c*.json "$OUTDIR"/glm52_*.cmd "$OUTDIR"/glm52_*.serverlog \
+          "$OUTDIR"/glm52_*.gpu_metrics.csv "$OUTDIR"/run_config.json "$OUTDIR"/config.json \
+          "$OUTDIR"/tps_curve.csv "$OUTDIR"/tps_raw.csv \
+          "$OUTDIR"/tps_*_s*.svg "$OUTDIR"/*.html "$PREV/" 2>/dev/null || true
     echo "注意: OUTDIR 已有旧结果, 已移入 $PREV/ 隔离本次运行(原始数据保留)"
   fi
 fi
@@ -352,6 +488,7 @@ echo " GLM-5.2 benchmark  (config: $CONFIG)"
 echo " model=$MODEL_NAME quant=$QUANT   MODEL=$MODEL"
 [[ -n "$MTP_DRAFT_PATH" ]] && echo " MTP draft=$MTP_DRAFT_PATH"
 echo " SEQLENS(ISL)=$SEQLENS  OSL=$OSL  REPS=$REPS  GPU=$GPU_COUNT  (默认 batches=$BATCHES_DEF)"
+echo " 测量口径: $METRIC_DESC"
 echo " 曲线 (逐条 = 图上一条线):"
 for cl in "${CURVE_LINES[@]}"; do
   IFS=$'\x1f' read -r _i _bk _par _n _acc _batches _commit _note <<< "$cl"
@@ -374,7 +511,7 @@ if [[ "$DRY_RUN" != "1" ]]; then
     _mtptag="mtpN${_n}A${_acc}"; [[ "$_n" -gt 0 ]] || _mtptag="mtpoff"
     _series_json+="${_series_json:+, }\"${_bk}-${BK_SERIES_COMMIT[$_bk|$_commit]}-${_par}-${_mtptag}\""
   done
-  python3 - "$CONFIG" "$OUTDIR/run_config.json" <<PY
+  python3 - "$CONFIG" "$OUTDIR/run_config.json" "$METRIC_MODE" "$METRIC_DESC" <<PY
 import json, sys, datetime
 cfg = json.load(open(sys.argv[1]))
 json.dump({
@@ -383,13 +520,15 @@ json.dump({
     "config_path": sys.argv[1],
     "model_name": "$MODEL_NAME", "quant": "$QUANT",
     "series": [$_series_json],
-    "metric": "steady-state max-TTFT window (decode-only, 刨 prefill/ramp); "
-              "UTPS=各请求窗内速率中位数, STPS/gpu=窗内总token/窗长/gpu",
-    "note": "各曲线的 MTP (N/accept_len) 按其 cookbook 操作点逐曲线取值, 不是控 MTP 单变量比并行; "
-            "启服务的完整命令(含 hack env)见各曲线的 .cmd",
+    "metric_mode": sys.argv[3],
+    "metric": sys.argv[4],
+    "note": "启服务的完整命令(含 hack env)见各曲线的 .cmd",
     "config": cfg,
 }, open(sys.argv[2], "w"), indent=2, ensure_ascii=False)
 PY
+  # ★输入 config 逐字拷进输出目录★: run_config.json 里那份是 json.load 后重新序列化的(注释/
+  # 键序都丢了), 不能直接拿来 `bash bench.sh --config` 复现. 这份是原文件的字节副本.
+  cp -f "$CONFIG" "$OUTDIR/config.json"
 fi
 
 # ============================ 逐曲线 × 逐 seqlen 起容器 ============================
@@ -401,9 +540,20 @@ for cl in "${CURVE_LINES[@]}"; do
   SRC="${BK_SRC[$backend|$commit]}"
   SERIES_COMMIT="${BK_SERIES_COMMIT[$backend|$commit]}"
 
+  # ★容器内脚本按【量化】分成两套★(fp8 那两份是产出 fp8 定稿的东西, 不让 fp4 的改动碰它):
+  #   fp8/bf16/... -> glm5.2_fp8_b200_<backend>_mtp.sh
+  #   nvfp4/fp4/mxfp4 -> glm5.2_fp4_b200_<backend>_mtp.sh (多 --quantization modelopt_fp4 等 fp4 旋钮)
+  # $QUANT 是从 defaults.model 的权重目录名拆出来的(见上方 _wdir 那段), 与图名里的 quant 同源。
+  # 目标脚本【不存在就直接报错】—— 否则会静默退回 fp8 脚本、拿着"没下发 --quantization"的
+  # 配置跑 fp4 权重(引擎走自动识别, 未必是 NVFP4 kernel), 事后极难发现。
+  case "$QUANT" in
+    nvfp4|fp4|mxfp4) SCRIPT_QUANT=fp4;;
+    *)               SCRIPT_QUANT=fp8;;
+  esac
+
   case "$backend" in
     sglang)
-      BENCH_REL="benchmarks/single_node/fixed_seq_len/glm5.2_fp8_b200_sglang_mtp.sh"
+      BENCH_REL="benchmarks/single_node/fixed_seq_len/glm5.2_${SCRIPT_QUANT}_b200_sglang_mtp.sh"
       # sglang 专属 docker 参数
       BK_DEVICE=( --device /dev/infiniband )
       BK_ENV=( -e NCCL_SHM_DISABLE=1 -e GLM_XGRAMMAR_BACKEND_CACHE_MAX_MB=76800
@@ -418,27 +568,52 @@ for cl in "${CURVE_LINES[@]}"; do
       # 也会被代理走.
       [[ -n "$SRC" ]] && BK_ENV+=( -e BENCH_SGL_SRC="$SRC" -e BENCH_SGL_COMMIT="$commit"
                                    -e PIP_PROXY="$FETCH_PROXY" )
+      # 基座镜像 tag: 只为写进 .cmd 的版本记录(源码 tarball 无 .git -> __version__ 恒 0.0.0,
+      # 光看它认不出版本; 记下 tag + 基座自带版本号才能事后判断跑的是哪一版).
+      BK_ENV+=( -e BENCH_IMAGE_TAG="$IMAGE" )
       ;;
     vllm)
-      BENCH_REL="benchmarks/single_node/fixed_seq_len/glm5.2_fp8_b200_vllm_mtp.sh"
-      # vllm 专属: 关对称内存死锁两处 + 关 inductor max-autotune + 跳过 deepgemm warmup
-      BK_DEVICE=()
-      BK_ENV=( -e VLLM_ALLREDUCE_USE_SYMM_MEM=0 -e VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE=0
+      BENCH_REL="benchmarks/single_node/fixed_seq_len/glm5.2_${SCRIPT_QUANT}_b200_vllm_mtp.sh"
+      # vllm 专属: 关 inductor max-autotune(否则首次编译卡死) + 跳过 deepgemm warmup(加快启动).
+      # ★曾经硬注入的 VLLM_ALLREDUCE_USE_SYMM_MEM=0 已移除★: 它与脚本里的
+      # fuse_allreduce_rms=false 是同一个 torch symm_mem 死锁的两个入口, 而那个死锁的根因
+      # (node071 GPU6 的 18 条 NVLink 全掉 -> FM 编不出 8 卡多播路由) 已于 2026-07-27 用单卡
+      # reset 修好, sglang 侧三个同类规避也都撤了 —— 继续钉死等于让 vllm 白白退回 CUSTOM
+      # all-reduce 且丢掉 allreduce+rmsnorm 融合(tp 曲线低并发受害最重).
+      # 复发时的退路(两个都要): curve 的 env 里加 "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
+      # 并把 AR_FUSION 设 0(脚本据此下发 fuse_allreduce_rms=false). 上机前先按 CLAUDE.md
+      # 那条 nvlink 循环确认 8 张卡都是 18 条链路.
+      # DeepEP(=EP 曲线的 all2all 后端)底下是 NVSHMEM, 与 sglang 那边同样需要能看到 IB 设备
+      # ——单节点 unified 其实只走 NVLink, 但缺 /dev/infiniband 时 NVSHMEM 初始化会直接失败.
+      # 节点上没有该设备就不挂(非 EP 曲线本来也用不到).
+      BK_DEVICE=(); [[ -e /dev/infiniband ]] && BK_DEVICE=( --device /dev/infiniband )
+      BK_ENV=( -e VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE=0
                -e VLLM_DEEP_GEMM_WARMUP=skip -e PYTHONFAULTHANDLER=1 )
       BK_MOUNT=( -v /mnt/ramweights/jitp/cache:/root/.cache
                  -v /mnt/ramweights/jitp/triton:/root/.triton )
       ;;
     tokenspeed)
-      BENCH_REL="benchmarks/single_node/fixed_seq_len/glm5.2_fp8_b200_tokenspeed_mtp.sh"
+      BENCH_REL="benchmarks/single_node/fixed_seq_len/glm5.2_${SCRIPT_QUANT}_b200_tokenspeed_mtp.sh"
       BK_DEVICE=()
       # getting-started 建议 --ipc host (已在通用 docker run 里); 无 vllm/sglang 那种 hack env.
-      BK_ENV=( -e PYTHONFAULTHANDLER=1 )
+      # ★SERVER_PROXY★(踩过, 2026-07-30): tokenspeed 0.1.0 起改用 flashinfer-python 的
+      # trtllm-gen MoE GEMM(旧 :glm-radix 用自带的 tokenspeed-trtllm-kernel, 完全离线), 而那些
+      # cubin 是【运行期按需从 edge.urm.nvidia.com 下载】的 —— 节点无外网时下载超时 ->
+      # `trtllm_batched_gemm_runner.cu:305 Error occurred when running GEMM!` -> engine worker 挂
+      # -> smg 网关 gRPC broken pipe -> 客户端所有请求 500 瞬拒(completed=0, 极易误判成"客户端
+      # 参数不对"). 该 host 经 defaults.fetch_proxy 可达(实测 200). ★只能给 server 进程★:
+      # 设成容器级 HTTP_PROXY 会把 client 连 0.0.0.0:PORT 的压测请求也代理走(NO_PROXY 里的
+      # 127.0.0.1 盖不住 0.0.0.0), 那次 16 个请求 0.01s 内全灭 —— 见容器脚本 start_server。
+      BK_ENV=( -e PYTHONFAULTHANDLER=1 -e SERVER_PROXY="$FETCH_PROXY" )
       BK_MOUNT=( -v /mnt/ramweights/jitp/cache:/root/.cache
                  -v /mnt/ramweights/jitp/triton:/root/.triton )
       ;;
     *) echo "⚠️  未知 backend: $backend, 跳过" >&2; continue;;
   esac
-  [[ -f "$REPO/$BENCH_REL" ]] || { echo "错误: 找不到 $REPO/$BENCH_REL" >&2; exit 1; }
+  [[ -f "$REPO/$BENCH_REL" ]] || {
+    echo "错误: 找不到 $REPO/$BENCH_REL" >&2
+    echo "      (量化=$QUANT -> 需要 ${SCRIPT_QUANT} 版的 $backend 容器内脚本; 请照 fp8 那份复制一份并加上该量化需要的 flag)" >&2
+    exit 1; }
 
   # 翻译 canonical(vllm 语义) -> 各 backend 的 flag
   parallel_canonical "$par"
@@ -468,6 +643,10 @@ for cl in "${CURVE_LINES[@]}"; do
   done
   for k in "${!_envmap[@]}"; do CFG_ENV+=( -e "$k=${_envmap[$k]}" ); done
   unset _envmap
+  # 出自 config 的 env 块的 key 名单(defaults 层 + 本曲线层) -> 容器内脚本据此把 .cmd 的 env
+  # 段补全(见 loader 里 K 记录的说明). 只有名单, 值仍走上面的 -e.
+  CFG_ENV_KEY_LIST="$(printf '%s\n%s\n' "${CFG_ENV_KEYS[D]:-}" "${CFG_ENV_KEYS[$idx]:-}" \
+    | tr ',' '\n' | grep -vE '^\s*$' | sort -u | tr '\n' ' ')"
 
   # series = 图上曲线名 = 结果文件名里的那一段: 逐曲线变化的全部字段
   # (backend / commit / parallel / MTP). 只含 [A-Za-z0-9.+-](accept_len 可能是小数,
@@ -477,7 +656,7 @@ for cl in "${CURVE_LINES[@]}"; do
   for seqlen in "${SL_ARR[@]}"; do
     seqlen="${seqlen// /}"; [[ -z "$seqlen" ]] && continue
     prefix="glm52_${series}_s${seqlen}"
-    CNAME="ix-glm52-${series}-s${seqlen}"
+    CNAME="$(docker_name "ix-glm52-${series}-s${seqlen}")"
     echo ">>> [$series] ISL=$seqlen  tp=$BK_TP dp=$BK_DP ep=$BK_EP  MTP N=$CN acc=$CACC  c=$CBATCH  (容器 $CNAME)"
     if [[ "$DRY_RUN" == "1" ]]; then
       echo "    (dry-run) 镜像=$IMAGE  脚本=$BENCH_REL  额外env=${CFG_ENV[*]:-无}"
@@ -488,19 +667,27 @@ for cl in "${CURVE_LINES[@]}"; do
     # HTTP 连接, 所以 c=1024 时只开得出 ~1018 条 socket, 余下 6 个请求【静默失败】——
     # 实测 completed=1018/1024(warmup 轮与正式轮都恰好 1018, 确定性), 表现为"少发了请求"
     # 而不是任何报错, 极难发现。c>=1024 的点必须抬这个限。
+    #
+    # ★--cap-add SYS_PTRACE★(踩过, 2026-07-29): vllm 的 flashinfer_nvlink_* all2all 后端
+    # (官方 GLM-5.2-NVFP4 博客 decode 节点用的那个)靠 pidfd_getfd() 在 DP rank 之间传 fd,
+    # 容器里缺这个 capability 就在【第一次 MoE forward 时】抛
+    #   RuntimeError: pidfd_getfd(...) failed with errno 1: Operation not permitted.
+    #                 If running in a container, try adding --cap-add=SYS_PTRACE
+    # -> 8 个 worker 全崩、completed=0。顺带也让容器内 py-spy 不必再 --privileged。
     docker run --rm --name "$CNAME" \
       --gpus "\"device=$GPU_DEV\"" --network host --ipc host --shm-size 64g \
       --ulimit nofile=524288:524288 \
-      --cap-add CAP_IPC_LOCK "${BK_DEVICE[@]}" \
+      --cap-add CAP_IPC_LOCK --cap-add SYS_PTRACE "${BK_DEVICE[@]}" \
       -e PYTHONUNBUFFERED=1 -e PYTHONNOUSERSITE=1 \
       -e TORCH_CUDA_ARCH_LIST=10.0 -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e PORT=30000 \
       "${BK_ENV[@]}" \
       -e MODEL="$MODEL" -e MTP_DRAFT_PATH="$MTP_DRAFT_PATH" \
       -e TP="$BK_TP" -e DP="$BK_DP" -e EP="$BK_EP" \
-      -e CONC="$CBATCH" -e ISL="$seqlen" -e OSL="$OSL" \
+      -e CONC="$CBATCH" -e ISL="$seqlen" -e OSL="$OSL" -e GPU_COUNT="$GPU_COUNT" \
       -e RANDOM_RANGE_RATIO=1.0 \
       -e REPS="$REPS" -e RESULT_FILENAME="$prefix" -e RESULT_DIR="$OUTDIR" \
       -e MTP="$MTP_ON" -e SPEC_NUM_STEPS="$CN" -e MTP_ACC="$CACC" \
+      -e BENCH_CFG_ENV_KEYS="$CFG_ENV_KEY_LIST" \
       "${CFG_ENV[@]}" \
       -v "$REPO":/workspace -v /tilert:/tilert -v /mnt/ramweights:/mnt/ramweights \
       "${BK_MOUNT[@]}" \
@@ -522,6 +709,7 @@ echo "=========================================================="
 echo " 完成. 产物在 $OUTDIR :"
 echo "   - $REPORT   (全部曲线 + 全部原始数据)"
 echo "   - tps_curve.csv / tps_raw.csv / tps_curve_s*.svg / run_config.json"
+echo "   - config.json  (输入 config 逐字副本; 复现: bash bench.sh --config $OUTDIR/config.json)"
 echo "=========================================================="
 exit $RUN_RC
 

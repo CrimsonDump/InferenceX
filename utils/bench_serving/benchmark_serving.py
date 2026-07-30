@@ -1029,22 +1029,24 @@ def main(args: argparse.Namespace):
         ))
 
     # 稳态 decode 指标: max-TTFT 窗口 (物理保证无 prefill), 注入结果 JSON.
-    if getattr(args, "steady_state", True):
-        steady = compute_steady_state_metrics(
-            per_req_itls=benchmark_result.get("itls", []),
-            ttfts=benchmark_result.get("ttfts", []),
-            output_lens=benchmark_result.get("output_lens", []),
-            gpu_count=args.gpu_count,
-        )
-        benchmark_result.update(steady)
-        print("{s:{c}^{n}}".format(
-            s=' Steady-State (max-TTFT window, prefill-excluded) ', n=56, c='='))
-        for _k in ("steady_utps_per_user", "steady_stps_system",
-                   "steady_stps_per_gpu", "steady_window_dur_s",
-                   "steady_window_tokens_total", "steady_ttft_min_s",
-                   "steady_ttft_max_s", "steady_num_reqs"):
-            if _k in steady:
-                print("{:<40} {:<12.4f}".format(_k + ":", steady[_k]))
+    # 【无条件算】—— 它和全程口径(mean_tpot / total_token_throughput, 上面已在 JSON 里)是同一批
+    # 原始数据的两种事后算法, 都留在结果 JSON 里, 由报告端的 metric_mode 决定画哪套(见
+    # runners/config.json 的 defaults.metric_mode). 客户端不该也不需要知道要报哪个口径.
+    steady = compute_steady_state_metrics(
+        per_req_itls=benchmark_result.get("itls", []),
+        ttfts=benchmark_result.get("ttfts", []),
+        output_lens=benchmark_result.get("output_lens", []),
+        gpu_count=args.gpu_count,
+    )
+    benchmark_result.update(steady)
+    print("{s:{c}^{n}}".format(
+        s=' Steady-State (max-TTFT window, prefill-excluded) ', n=56, c='='))
+    for _k in ("steady_utps_per_user", "steady_stps_system",
+               "steady_stps_per_gpu", "steady_window_dur_s",
+               "steady_window_tokens_total", "steady_ttft_min_s",
+               "steady_ttft_max_s", "steady_num_reqs"):
+        if _k in steady:
+            print("{:<40} {:<12.4f}".format(_k + ":", steady[_k]))
 
     # Save config and results to json
     if args.save_result:
@@ -1447,11 +1449,8 @@ if __name__ == "__main__":
 
     parser.add_argument('--num-warmups', type=int, default=0)
 
-    # 稳态 decode 采样 (max-TTFT 窗口, 物理保证窗内无 prefill)
-    parser.add_argument('--steady-state', action='store_true', default=True,
-                        help="计算稳态 UTPS/STPS(max-TTFT 窗口), 默认开.")
-    parser.add_argument('--no-steady-state', dest='steady_state',
-                        action='store_false')
+    # 稳态 decode 采样 (max-TTFT 窗口, 物理保证窗内无 prefill) 恒开, 无开关 ——
+    # 报哪套口径是【报告端】的事(config.json 的 defaults.metric_mode), 不是压测端的事.
     parser.add_argument('--gpu-count', type=int, default=8,
                         help="用于把系统吞吐换算成每GPU吞吐(STPS/gpu).")
 

@@ -7,8 +7,7 @@
 # 必需: MODEL TP CONC ISL OSL RANDOM_RANGE_RATIO RESULT_FILENAME
 # 由 config.json 的【一等字段】落下来(名字见 bench.sh 的 *_ENV_FIELDS 映射):
 #   defaults: GPU_COUNT NUM_WARMUPS(=num_warmups) ARCH_BASE(=arch_base) REPS RESULT_DIR
-# ★本脚本是 fp8 专用★: nvfp4 权重走同目录的 glm5.2_fp4_b200_sglang_mtp.sh
-#   (它多一段 --quantization modelopt_fp4; bench.sh 按 quant 分发, 见其 BENCH_REL 那段).
+#             QUANTIZATION(=quantization; 空=让引擎自动识别, nvfp4 权重需 modelopt_fp4)
 #   curve:    DP(默认=TP) EP(默认1=关; >1走deepep) MTP(默认1) SPEC_NUM_STEPS(=mtp_n)
 #             MTP_ACC(=mtp_acc) MTP_DRAFT_PATH MEM_FRAC(=mem_frac)
 #             CHUNKED_PREFILL_SIZE(=chunked_prefill_size) MAX_RUNNING_REQUESTS(=max_running_requests)
@@ -243,9 +242,20 @@ print("prewarm ok: trtllm_gen_fused_moe_sm100 cubin symlink 就位")
 ' || echo "(预热跳过: flashinfer 侧无此路径或取 cubin 失败, 见上方报错)"
 fi
 
+# 量化方式: 权重目录里的 quantization_config 不一定能被自动识别成引擎想要的那条路径
+# (nvidia/GLM-5.2-NVFP4 是 modelopt 导的, config 里是 compressed-tensors 风格的
+#  config_groups, 需显式 --quantization modelopt_fp4 才走 NVFP4 kernel).
+# fp8 权重不设此项 -> 走自动识别, 行为与以前完全一致.
+QUANT_ARGS=()
+if [[ -n "${QUANTIZATION:-}" ]]; then
+    QUANT_ARGS=( --quantization="$QUANTIZATION" )
+    echo "显式 --quantization=$QUANTIZATION"
+fi
+
 SERVER_ARGS=(
     --model-path="$MODEL"
     --trust-remote-code
+    ${QUANT_ARGS[@]+"${QUANT_ARGS[@]}"}
     --host=0.0.0.0 --port="$PORT"
     --enable-metrics
     --tensor-parallel-size="$TP"

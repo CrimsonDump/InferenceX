@@ -38,70 +38,11 @@
 #     synthetic_acceptance_length=6 => 每 decode step 恒接受 6 token (5 draft + 1),
 #     与 sglang accept_len=6 逐步恒定完全一致. MTP_ACC<=0 则不设 -> 走自然接受(对照用).
 #
-# ============================================================================
-# ★2026-07-29 tp/fp8 调优台账 —— 别重做已否定的实验★
-# 基准: ISL8192/OSL1024, whole-run 口径, tp=8, MTP N=5/acc=3.5, node076.
-# 对照 sglang-fdebc938-tp 同格: c1 300.9 / c16 123.5 UTPS.
-#
-#   已验证有效(现已成为本脚本默认或推荐):
-#     1) --kv-cache-dtype fp8_e4m3      c1 +11% / c16 +14%(与 2) 合计). ★最大单项★
-#        不给它 = auto = bf16 KV -> KV 池 742,528 而非 1,434,240 tok, c=256 直接排队.
-#     2) 撤掉 VLLM_ALLREDUCE_USE_SYMM_MEM=0 + fuse_allreduce_rms=false 两个旧规避.
-#        vllm 官方 Blackwell 博客把 "AllReduce+RMSNorm+Quant 单 kernel" 列为头条优化,
-#        我们却一直关着. 撤掉后日志可见 backend=mnnvl 且不死锁.
-#     3) VLLM_USE_V2_MODEL_RUNNER=1     再 +1.6%(c1) / +2.0%(c16), KV 池还大 4%.
-#        官方 B300 博客标 "-11% TPOT"(那是 300~700 并发下测的, 我们低并发只吃到 ~2%).
-#        ★目前仍需在 curve env 里显式给★: 只在 tp 上验证过, dep/EP 路径未验.
-#     最佳组合结果: c1 254.5 / c16 98.1 UTPS = 仍差 sglang -15.4% / -20.5%
-#     (起点 225.2 / 84.4 = -25.1% / -31.7%, 即追回约四成).
-#
-#   已实测否定(有明确代码级或数据级理由, 不要再试):
-#     x) --attention-backend FLASHMLA_SPARSE + fp8_ds_mla: 四个并发点全线更差
-#        (UTPS -4%~-29%, STPS -11%~-31%, TTFT 稳定 +55%), 且 KV 池反而小 11%.
-#        日志里那句 "To use DeepSeek's fp8_ds_mla ... please set FLASHMLA_SPARSE" 是
-#        【说明】不是建议; vllm 自动选的 FLASHINFER_MLA_SPARSE 就是对的.
-#     x) speculative use_local_argmax_reduction: 起服务即
-#        "ValueError: ... draft model DeepSeekMTP does not implement get_top_tokens()".
-#     x) pass_config enable_qk_norm_rope_fusion: 能激活但对本模型是 no-op ——
-#        "QK Norm+RoPE fusion enabled, but no Attention layers were discovered".
-#     x) pass_config fuse_rope_kvcache_cat_mla: 能激活, 但 c1 -0.3% / c16 -2.4%(无收益).
-#     x) pass_config enable_sp / fuse_gemm_comms: 【本模型必然被禁】Blackwell 要求
-#        hidden_size>=8192 而 GLM-5.2 只有 6144 -> get_sequence_parallelism_threshold
-#        返回 None -> vllm 主动把两者置 False. 就算手设 sp_min_token_num 绕过, 阈值也是
-#        21,845 token, 而 decode 一步才 6~1536 token.
-#     x) fuse_act_padding / fuse_mla_dual_rms_norm / fuse_rope_kvcache /
-#        fuse_qk_norm_rope_kvcache: 四个都硬性要求 is_rocm(), 在 CUDA 上被平台判掉.
-#     x) "Speculative Padding"(官方博客称单项最大改进): 对应 disable_padded_drafter_batch,
-#        默认就是 False = padding 本来就开着, 我们早已享受, 没有额外空间.
-#
-#   未验证/有已知副作用(想试先读这里):
-#     ?) CUDAGRAPH_MODE=FULL_DECODE_ONLY: 官方 B300 decode 节点用它, 但那是 PD 分离、
-#        decode 节点【不做 prefill】; 我们单机合一 + chunked prefill, 混合批会退 eager,
-#        很可能伤 TTFT. 要测就单独测、且要看 TTFT 而不只看 TPOT.
-#     ?) pass_config fuse_attn_quant: 官方博客点名, 但开启会强制 cudagraph_mode=FULL 并
-#        清空 splitting_ops —— 而 DSA 的 sparse_attn_indexer 就在里面, 等于换掉整个
-#        cudagraph 策略.
-#     ?) MOE_BACKEND A/B(现 auto -> FLASHINFER_TRTLLM): 纯试错, 无先验.
-#     ?) ★跨节点 confound 尚未消除★: 上面"仍差 sglang"用的 sglang 基准跑在 node071,
-#        vllm 跑在 node076. 要把差距完全归因给引擎, 得在同一台机器上重测 sglang.
-# ============================================================================
-#
 # 必需环境变量: MODEL TP CONC ISL OSL RANDOM_RANGE_RATIO RESULT_FILENAME
-# 可选(一等字段, 由 config.json 的 curve 落下来):
-#       DP(=TP, 仅 EP>1 时用) EP(默认1=关) SPEC_NUM_STEPS(=mtp_n) MTP(默认1)
-#       MTP_ACC(=mtp_acc) MTP_DRAFT_PATH REPS MAX_RETRY QUANTIZATION(=quantization)
-#       KV_CACHE_DTYPE(=kv_cache_dtype; 默认 fp8_e4m3, 见台账 1)
-#       ALL2ALL_BACKEND(=all2all_backend; 不给则 EP 曲线用 deepep_low_latency)
-#       ATTENTION_BACKEND(=attention_backend; 不给 = vllm 自动选, 这就是最优)
-#       CUDAGRAPH_MODE(=cudagraph_mode; 不给 = vllm 默认 FULL_AND_PIECEWISE)
-# 可选(逃生阀, 只该出现在 config.json 的 env 里):
-#       AR_FUSION(默认1=不下发规避) ASYNC_SCHEDULING(默认1) SERVER_WARMUP(默认1)
-#       MOE_BACKEND SPEC_EXTRA PASS_CONFIG_EXTRA
-#       VLLM_USE_V2_MODEL_RUNNER(推荐设 1, 见台账 3) VLLM_ALLREDUCE_USE_SYMM_MEM(坏 fabric 才设 0)
-
-# ★本脚本是 fp8 专用★: nvfp4 权重走同目录的 glm5.2_fp4_b200_vllm_mtp.sh (它多了
-#   --quantization modelopt_fp4 / cudagraph_mode / moe_backend 三个 fp4 期加的旋钮);
-#   bench.sh 按 quant 分发, 见其 BENCH_REL 那段.
+# 可选: DP(=TP, 仅 EP>1 时用) EP(默认1=关) SPEC_NUM_STEPS(=MTP-N,默认5)
+#       MTP(默认1) MTP_ACC(=accept_len,默认6) MTP_DRAFT_PATH REPS MAX_RETRY
+#       KV_CACHE_DTYPE(=curve 的 kv_cache_dtype, 默认 fp8_e4m3) ALL2ALL_BACKEND(=curve 的
+#       all2all_backend, 不给则 EP 曲线用 deepep_low_latency) AR_FUSION(默认1=不下发规避)
 
 source "$(dirname "$0")/../../benchmark_lib.sh"
 
@@ -116,10 +57,10 @@ check_env_vars \
 
 nvidia-smi || true
 
-# ★把"loader 注入了但本 backend 不实现"的旋钮显式喊出来★
+# ★把"loader 注入了但本 backend 不实现"的旋钮显式喊出来★(与 fp8 那份保持一致)
 # config.json 的一等字段是【全 backend 共用的】, loader 对任何曲线都会注入; 而下面这几个是
-# sglang 语义、vllm 没有对应物(或本脚本刻意不下发, 见文件头"不强行对齐 sglang"那条). 不喊的话
-# 就是【配了没生效还不报错】—— 与 loader 对未知字段直接报错的设计初衷相悖, 也最难事后发现.
+# sglang 语义、vllm 没有对应物(或本脚本刻意不下发). 不喊就是【配了没生效还不报错】——
+# 与 loader 对未知字段直接报错的设计初衷相悖, 也最难事后发现.
 for _k in CHUNKED_PREFILL_SIZE MAX_RUNNING_REQUESTS CUDA_GRAPH_MAX_BS NUM_PROMPTS_LIST; do
     if [[ -n "${!_k:-}" ]]; then
         case "$_k" in
@@ -147,11 +88,12 @@ EP="${EP:-0}"
 # 客户端 warmup 请求数 (由 bench.sh 注入, 默认 0; defaults.num_warmups 覆盖, cookbook 用 64).
 export NUM_WARMUPS="${NUM_WARMUPS:-0}"
 
-# context length -> --max-model-len. ★名字对齐★: loader 按 curve 的 context_length 注入的是
-# CONTEXT_LENGTH(与 sglang 脚本同名), 早前这里只读 CONTEXT_LEN, 差一截 -> curve 里配了
-# context_length 在 vllm 曲线上【静默无效】, 恒是 16384. 保留 CONTEXT_LEN 仅为脱离 bench.sh
-# 单独调试时的兜底. "off" = 不下发 -> 按权重的 max_position 算(GLM-5.2 是 1M), 与 sglang 侧
-# 同义(会显著改变 KV 池换算出的 "Maximum concurrency", 读日志时注意).
+# context length -> --max-model-len. ★名字对齐★(2026-07-29 修): loader 按 curve 的
+# context_length 注入的是 CONTEXT_LENGTH(与 sglang 脚本同名), 这里早前只读 CONTEXT_LEN, 差一截
+# -> curve 里配的 context_length 在 vllm 曲线上【静默无效】, 恒是 16384。★这意味着此前所有
+# 写了 context_length:"off" 的 vllm 曲线其实都跑的 16384★, 修好后行为会变(不下发 -> 按权重
+# max_position=1M 算 KV 池, 日志里的 "Maximum concurrency" 会大不相同), 对比历史数据时注意。
+# 保留 CONTEXT_LEN 仅为脱离 bench.sh 单独调试时的兜底。
 CONTEXT_LEN="${CONTEXT_LENGTH:-${CONTEXT_LEN:-16384}}"
 CONTEXT_LEN_ARGS=()
 case "$CONTEXT_LEN" in
@@ -176,12 +118,23 @@ SERVER_LOG="$RESULT_DIR/${RESULT_FILENAME:-server}.serverlog"
 
 echo "CONC=$CONC ISL=$ISL OSL=$OSL RANGE=$RANDOM_RANGE_RATIO MTP=$MTP N=$SPEC_NUM_STEPS ACC=$MTP_ACC TP=$TP DP=$DP EP=$EP"
 
+# 量化方式(= defaults.quantization -> QUANTIZATION). 不给则让 vllm 按权重目录的
+# quantization_config 自动识别(fp8 权重就这样, 行为与以前完全一致); modelopt 导出的 NVFP4
+# 权重(nvidia/GLM-5.2-NVFP4)必须显式给 modelopt_fp4 才走 NVFP4 kernel —— 0.26.0 的
+# QUANTIZATION_METHODS 里确认有 modelopt_fp4.
+QUANT_ARGS=()
+if [[ -n "${QUANTIZATION:-}" ]]; then
+    QUANT_ARGS=( --quantization "$QUANTIZATION" )
+    echo "显式 --quantization $QUANTIZATION"
+fi
+
 # vllm serve 的 model 是位置参数; 不设 --served-model-name, 使 model id = $MODEL 路径,
 # 与 client 的 --model "$MODEL" 对齐 (否则 404 model not found).
 SERVER_ARGS=(
     "$MODEL"
     --port "$PORT"
     --trust-remote-code
+    ${QUANT_ARGS[@]+"${QUANT_ARGS[@]}"}
     --tensor-parallel-size "$TP"
     --gpu-memory-utilization "$MEM_FRAC"
     --max-num-seqs "$MAX_NUM_SEQS"
@@ -235,18 +188,15 @@ if [[ -n "${ALL2ALL_BACKEND:-}" ]]; then
         *) SERVER_ARGS+=( --all2all-backend "$ALL2ALL_BACKEND" );;
     esac
 elif [[ "${EP:-0}" -ge 1 ]]; then
-    # ★默认值实测定于 2026-07-29(dep c=64, ISL8192/OSL1024), 别改回 deepep_low_latency★
-    #   a2a 后端                        TPOT      TTFT mean   总耗时   STPS/gpu
-    #   deepep_low_latency              21.60ms   10606ms     36.9s    1999.2
-    #   flashinfer_nvlink_two_sided     21.59ms    8016ms     30.3s    2435.5  (+21.8%)
-    # ★TPOT 逐位相同、差别 100% 在 prefill★ —— DeepEP 的两种模式是有分工的:
-    #   low_latency 专为 decode(每 rank token 数极小)优化, high_throughput 才管大批量 a2a.
-    # 官方 GLM-5.2 B300 博客的 decode 节点用 low_latency 是因为它 **PD 分离、decode 节点
-    # 永远不做 prefill**; 我们是【单机合一】, 同一个 engine 要 prefill, 照抄就把 TTFT 拖垮.
-    # (同类陷阱还有 cudagraph_mode=FULL_DECODE_ONLY, 见文件头台账 —— 凡是 PD 分离 decode
-    #  节点的配方, 搬到 unified 之前都要先问一句"它是不是把 prefill 的代价甩给别人了".)
+    # 与 fp8 那份保持一致(别让两个 quant 分支漂移). ★依据是 fp8 上的实测★
+    # (dep c=64, ISL8192/OSL1024: deepep_low_latency 21.60ms TPOT / 10606ms TTFT / STPS 1999
+    #  vs flashinfer_nvlink_two_sided 21.59ms / 8016ms / STPS 2435, 即 +21.8%):
+    # 两者 TPOT 逐位相同, 差别 100% 在 prefill —— DeepEP 的 low_latency 是给【不做 prefill 的
+    # PD-decode 节点】用的, 我们单机合一要 prefill, 照抄就把 TTFT 拖垮.
+    # ⚠️ fp4 上【尚未复验】: 机理与量化格式无关(是 a2a 模式之分, 不是权重之分), 故沿用同一默认,
+    #    但真要下结论请在 nvfp4 上重跑一次 A/B.
     SERVER_ARGS+=( --all2all-backend flashinfer_nvlink_two_sided )
-    echo "EP 曲线未指定 all2all_backend -> 默认 flashinfer_nvlink_two_sided (单机合一下实测优于 deepep_low_latency: STPS +21.8%)"
+    echo "EP 曲线未指定 all2all_backend -> 默认 flashinfer_nvlink_two_sided (fp8 实测优于 deepep_low_latency; fp4 未复验)"
 fi
 
 # ---- 注意力后端 ----
@@ -264,11 +214,26 @@ if [[ -n "${ATTENTION_BACKEND:-}" ]]; then
     esac
 fi
 
-# ---- MoE kernel ----
-# vllm 的 auto 选择顺序取第一个支持当前配置的, 本模型(fp8)上自动选中 FLASHINFER_TRTLLM
-# (日志 "Using FLASHINFER_TRTLLM Fp8 MoE backend out of potential backends: [...]").
-# 小 batch 下 trtllm 的 tile 可能浪费, 故留旋钮; 但★尚无先验, 属试错项★.
-# 与 fp4 那份脚本保持同一实现, 别让两个 quant 分支的行为漂移.
+# ---- 每步 prefill token 预算 ----
+# 不给则走 vllm 默认. 官方 GLM-5.2-NVFP4 博客的 decode 节点给的是 1024 —— 但它是 PD 分离,
+# decode 引擎几乎不跑 prefill; 我们是单节点 unified, 给小值会把 ISL8192 切成更多 chunk:
+#   -> TTFT 变差, 且 whole-run 的 mean_TPOT(含被 prefill 抢走的 step)结构也变,
+#      故【设了它的点与没设的点不可逐格比】, 报告里必须标注.
+# 用途: 规避 attn-DP + spec 下 shm_broadcast 的死锁(vllm #41530 / vllm-ascend #9405, 上游未修;
+#   已知调大 max_chunks 无效, 关 graph capture 也无效 —— 降低 prefill 压力是仅剩的结构性差异).
+if [[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]]; then
+    case "$MAX_NUM_BATCHED_TOKENS" in
+        off|OFF|default) echo "MAX_NUM_BATCHED_TOKENS=$MAX_NUM_BATCHED_TOKENS: 不下发(走 vllm 默认)";;
+        *) SERVER_ARGS+=( --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" )
+           echo "--max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS";;
+    esac
+fi
+
+# ---- NvFp4 MoE kernel ----
+# vllm 的 auto 选择顺序是 FLASHINFER_TRTLLM > CUTEDSL > CUTEDSL_BATCHED > CUTLASS > ...(取第一个
+# 支持当前配置的), 本模型上自动选中 FLASHINFER_TRTLLM(日志 "Using 'FLASHINFER_TRTLLM' NvFp4 MoE
+# backend out of potential backends: [...]"). 小 batch 下 trtllm 的 tile 可能浪费, 故留旋钮.
+# 注: FLASHINFER_B12X 被上游从自动候选里排除(CUTLASS SM121 guard), 与 B200(SM100) 无关.
 if [[ -n "${MOE_BACKEND:-}" ]]; then
     case "$MOE_BACKEND" in
         off|OFF|default|auto) echo "MOE_BACKEND=$MOE_BACKEND: 不指定 moe_backend (走 vllm 自动选择)";;
@@ -305,13 +270,10 @@ if [[ "$MTP" == "1" ]]; then
         echo "MTP=1, accept_len 自然接受 (synthetic 未设, MTP_ACC=$MTP_ACC)"
     fi
     # 逃生阀: 往 --speculative-config 里追加实验性键值(逗号分隔的 JSON 片段, 不含外层花括号).
+    # 例: SPEC_EXTRA='"use_local_argmax_reduction":true'
+    #   —— 把 draft token 的 logits 通信从 O(vocab) 降到 O(2*tp)(只对 greedy + 非树形 spec 生效,
+    #      我们两条都满足); N=5 时每个 decode step 有 5 次全 vocab all-gather, 故对 tp 曲线有意义.
     # 之所以用 env 而不是一等字段: 这些是【一次性 A/B 的实验量】, 验证有效才该升字段.
-    # ⚠️ 反例(2026-07-29 实测, 别再试): SPEC_EXTRA='"use_local_argmax_reduction":true'
-    #    看着很对症(把 draft logits 通信从 O(vocab) 降到 O(2*tp), 而 N=5 时每 step 有 5 次全
-    #    vocab all-gather), 但起服务直接抛:
-    #      ValueError: use_local_argmax_reduction is enabled but draft model DeepSeekMTP
-    #                  does not implement get_top_tokens().
-    #    —— 该优化只对实现了 get_top_tokens() 的 draft 模型有效, MTP 不在其列.
     if [[ -n "${SPEC_EXTRA:-}" ]]; then
         SPEC="$SPEC,$SPEC_EXTRA"
         echo "speculative-config 追加: $SPEC_EXTRA"
@@ -329,13 +291,12 @@ fi
 # 复发时 AR_FUSION=0 关回去(还要同时在 curve env 里给 VLLM_ALLREDUCE_USE_SYMM_MEM=0,
 # 两个入口得一起堵). 判据见 CLAUDE.md「多播死锁的根因与修法」: 卡在 torch.compile 且无报错.
 #
-# ★--compilation-config 只能给一次★, 所以下面把三处来源(CUDAGRAPH_MODE / AR_FUSION /
-# PASS_CONFIG_EXTRA)合成【一个】JSON —— 各自 SERVER_ARGS+= 会互相覆盖(后者胜), 静默丢配置.
+# ★--compilation-config 只能给一次★, 所以下面把两处来源(cudagraph_mode 与 AR_FUSION 的
+# pass_config)合成【一个】JSON —— 之前它们各自 SERVER_ARGS+= 会互相覆盖(后者胜), 静默丢配置.
 #
-# CUDAGRAPH_MODE: vllm 默认同时捕 "mixed prefill-decode(PIECEWISE)" 与 "decode(FULL)" 两套图.
-#   官方 GLM-5.2-NVFP4 的 decode 节点用 FULL_DECODE_ONLY(vllm.ai/blog/2026-07-23-glm-5.2-nvfp4-b300-pd),
-#   ⚠️ 但那是 PD 分离、decode 节点【不做 prefill】; 我们单机合一 + chunked prefill, 设成
-#   FULL_DECODE_ONLY 会让混合批退 eager, 很可能伤 TTFT —— 要测就单独测且要看 TTFT. 未验证.
+# CUDAGRAPH_MODE: vllm 默认会同时捕 "mixed prefill-decode(PIECEWISE)" 与 "decode(FULL)" 两套图;
+#   官方 GLM-5.2-NVFP4 的 decode 节点用 FULL_DECODE_ONLY(见 vllm.ai/blog/2026-07-23-glm-5.2-nvfp4-b300-pd),
+#   纯 decode benchmark 下更贴近它。不设则走 vllm 默认。
 _cc_parts=()
 if [[ -n "${CUDAGRAPH_MODE:-}" ]]; then
     case "$CUDAGRAPH_MODE" in
@@ -351,12 +312,11 @@ if [[ "${AR_FUSION:-1}" == "0" ]]; then
     echo "按 AR_FUSION=0 关闭 allreduce+rms 融合 pass (坏 fabric 节点用; 记得同时设 VLLM_ALLREDUCE_USE_SYMM_MEM=0)"
 fi
 # 逃生阀: 往 pass_config 里追加实验性融合开关(逗号分隔的 JSON 片段, 不含外层花括号).
-# 语法示例: PASS_CONFIG_EXTRA='"fuse_rope_kvcache_cat_mla":true'
-# ⚠️ 举例用的这两个【已实测无用】(2026-07-29), 写在这只为说明语法, 不是推荐 —— 详见文件头台账:
-#   enable_qk_norm_rope_fusion 对本模型是 no-op("no Attention layers were discovered");
-#   fuse_rope_kvcache_cat_mla 能激活但 c1 -0.3% / c16 -2.4%.
-# ★判断某个 pass 有没有真接上, 要看【两行】★: "Enabled custom fusions: ..."(只表示声明生效)
-#   与该 pass 自己的 "no ... were discovered" 警告(才表示有没有匹配到模式). 前者有 ≠ 后者有.
+# 例: PASS_CONFIG_EXTRA='"fuse_rope_kvcache_cat_mla":true,"enable_qk_norm_rope_fusion":true'
+# ⚠️ 注意哪些是【ROCm 专用】、开了也会被平台判定关掉(实测源码 config/compilation.py):
+#   fuse_act_padding / fuse_mla_dual_rms_norm / fuse_rope_kvcache / fuse_qk_norm_rope_kvcache
+# 而 enable_sp / fuse_gemm_comms 在本模型上【必然被禁】: Blackwell 要求 hidden_size>=8192,
+#   GLM-5.2 只有 6144 -> get_sequence_parallelism_threshold 返回 None -> 两者一起 False.
 if [[ -n "${PASS_CONFIG_EXTRA:-}" ]]; then
     _pc_parts+=("$PASS_CONFIG_EXTRA")
     echo "pass_config 追加: $PASS_CONFIG_EXTRA"
@@ -388,9 +348,6 @@ fi
   emit_env AR_FUSION                       "★逃生阀★=0 时关 allreduce+rms 融合 pass (与上一条配对使用)"
   emit_env VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE "关 inductor max-autotune: 否则首次编译卡死"
   emit_env VLLM_DEEP_GEMM_WARMUP           "跳过 DeepGEMM 预热, 加快 server 启动"
-  # V2 model runner 不是默认开的, 必须显式设 1 (见台账 3: +1.6% c1 / +2.0% c16, KV 池还大 4%).
-  # 验证它真生效: serverlog 里 gpu_worker.py 打 "Using V2 Model Runner"(不设时该行完全不出现).
-  emit_env VLLM_USE_V2_MODEL_RUNNER        "开 V2 model runner(非默认, 需显式设 1)"
   # config 的 env 块里本脚本没显式列到的项也要进 .cmd (见 benchmark_lib.sh::emit_cfg_env)
   emit_cfg_env
   echo "# 注: 固定 accept_len 的 hack 在 --speculative-config 的 synthetic_acceptance_length (见启服务命令)"
