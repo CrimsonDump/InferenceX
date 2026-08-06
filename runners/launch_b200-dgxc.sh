@@ -43,6 +43,9 @@ elif [[ $MODEL_PREFIX == "qwen3.5" && $PRECISION == "fp4" ]]; then
 elif [[ $MODEL_PREFIX == "glm5" && $PRECISION == "fp8" ]]; then
     export MODEL_PATH="/lustre/fsw/models/GLM-5-FP8"
     export SRT_SLURM_MODEL_PREFIX="glm5-fp8"
+elif [[ $MODEL_PREFIX == "glm5.1" && $PRECISION == "fp8" ]]; then
+    export MODEL_PATH="/lustre/fsw/models/GLM-5.1-FP8"   # TODO(核实): dgxc 上 GLM-5.1-FP8 权重的确切路径
+    export SRT_SLURM_MODEL_PREFIX="glm5.1-fp8"
 elif [[ $MODEL_PREFIX == "glm5" && $PRECISION == "fp4" ]]; then
     export MODEL_PATH="/lustre/fsw/models/GLM-5-NVFP4"
     export SRT_SLURM_MODEL_PREFIX="glm5-fp4"
@@ -86,6 +89,41 @@ fi
 export AIPERF_MMAP_CACHE_HOST_PATH="/lustre/fsw/gharunners/aiperf-cache"
 
 if [[ "$IS_MULTINODE" == "true" ]]; then
+    # ---- tileRT PD 分离多节点路径（非 Dynamo，绕过 srtctl；早退出，对 dynamo 路径零影响）----
+    # 编排逻辑抽到 benchmarks/multi_node/tilert_utils/（对标 amd_utils）：
+    #   disagg 薄入口 → tilert_utils/submit.sh(salloc/enroot/srun) → tilert_utils/run_node.sh(容器内按 PROCID 分角色)。
+    # 本分支只做 dgxc 专属注入 + 路由；salloc/账号/partition 等 dgxc 细节由 env 传下去。
+    if [[ "$FRAMEWORK" == "tilert" ]]; then
+        export MODEL="$MODEL_PATH"
+        export SLURM_PARTITION SLURM_ACCOUNT   # dgxc 专属，传给 tilert_utils/submit.sh
+        # tileRT decode 吃的是 weight_converter 产出的 8-shard，不是 HF 原始权重。转换 ~700 GiB /
+        # 数小时且是纯 CPU 工作，跑在独占的 16 卡分配里 → 必须跨 sweep 缓存复用（详见 run_node.sh
+        # 的 convert_weights）。放 gharunners 树是因为 /lustre/fsw/models 是 SRE root-owned、写不进去
+        # （同 MiniMax-M3 的先例）；也不能放 $GITHUB_WORKSPACE —— checkout clean:true 每个 job 会删掉它。
+        # 若 maintainer 已预置好 8-shard，把这里指到预置路径即可，转换会因 index.json 命中缓存而完全跳过。
+        # TODO(核实): dgxc 上这个可写路径的确切位置（与 MODEL_PATH 的 TODO 一并向 maintainer 确认）
+        export TILERT_WEIGHTS_DIR="${TILERT_WEIGHTS_DIR:-/lustre/fsw/gharunners/models/${MODEL_PREFIX}-${PRECISION}-tilert-8shard}"
+        # ---- RDMA / UCX（NIXL 的传输后端就是 UCX，跨节点传 KV 全靠它）----
+        # 这些值是**机器属性**，所以放 runner launcher，而不是 master config
+        # （先例：runners/launch_b200-nb.sh:16 也是在 launcher 里写 UCX_NET_DEVICES=eth0）。
+        # 取值直接抄同一个 runner(`b200-multinode`)、同硬件、同为 disagg+UCX 的在树 recipe：
+        #   benchmarks/multi_node/srt-slurm-recipes/vllm/deepseek-v4/8k1k/disagg-b200-low-latency-c1.yaml:38,45
+        # 不 pin 网卡时 UCX 会自己挑，多 NIC 机器上可能挑到管理网口 → KV 传输慢几个数量级或直接失败。
+        export UCX_NET_DEVICES="${UCX_NET_DEVICES:-mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_10:1,mlx5_11:1}"
+        # 同一份 recipe 里与 UCX_NET_DEVICES 成套出现的两项，同样关系到 CUDA 显存注册的正确性：
+        export UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE:-n}"
+        export UCX_MEMTYPE_REG_WHOLE="${UCX_MEMTYPE_REG_WHOLE:-n}"
+        # multinode 模板只注入 *_NUM_WORKERS/*_TP，不给 *_NODES；disagg 脚本要用，这里导出。
+        export PREFILL_NODES="${PREFILL_NODES:-${PREFILL_NUM_WORKERS:-1}}"
+        export DECODE_NODES="${DECODE_NODES:-${DECODE_NUM_WORKERS:-1}}"
+        # 按命名约定分发到 multi_node 的 disagg 薄入口（对标 AMD launcher 的 SCRIPT_NAME 做法）：
+        #   <model-prefix>_<precision>_b200_<framework>-disagg.sh，该入口再转 tilert_utils/submit.sh。
+        # 用 MODEL_PREFIX（本 launcher 顶部模型解析也用它），比 ${EXP_NAME%%_*} 直接、不依赖 exp-name 格式。
+        TILERT_DISAGG="$GITHUB_WORKSPACE/benchmarks/multi_node/${MODEL_PREFIX}_${PRECISION}_b200_${FRAMEWORK}-disagg.sh"
+        [[ -f "$TILERT_DISAGG" ]] || { echo "tilert disagg script not found: $TILERT_DISAGG"; exit 1; }
+        exec bash "$TILERT_DISAGG"
+    fi
+
     # Validate framework
     if [[ $FRAMEWORK != "dynamo-sglang" && $FRAMEWORK != "dynamo-trt" && $FRAMEWORK != "dynamo-vllm" ]]; then
         echo "Unsupported framework: $FRAMEWORK. Supported frameworks are: dynamo-trt, dynamo-sglang, dynamo-vllm"
