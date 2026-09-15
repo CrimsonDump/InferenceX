@@ -251,12 +251,27 @@ def recipe_node_count(prefill: dict, decode: dict) -> int | None:
         # config topology remains the best available scheduling estimate.
         return None
 
-    resources = yaml.safe_load(recipe_path.read_text())["resources"]
-    if "agg_nodes" in resources:
-        return int(resources["agg_nodes"])
-    if "prefill_nodes" in resources and "decode_nodes" in resources:
-        return int(resources["prefill_nodes"]) + int(resources["decode_nodes"])
-    raise ValueError(f"Recipe has no supported node resource fields: {recipe_path}")
+    recipe = yaml.safe_load(recipe_path.read_text())
+    if recipe.get("schema") != 2:
+        raise ValueError(f"srt-slurm recipes must declare schema: 2: {recipe_path}")
+    if "base" in recipe:
+        # A file with several override variants has no single authoritative
+        # node count. The selected master topology supplies the estimate.
+        return None
+    roles = recipe.get("roles")
+    if roles:
+        # Schema 2 groups node allocations by role. A colocated decode role
+        # shares prefill nodes and does not reserve another allocation.
+        for name, role in roles.items():
+            if "nodes" not in role:
+                raise ValueError(
+                    f"Recipe role {name!r} must specify nodes: {recipe_path}"
+                )
+        return sum(
+            0 if role["nodes"] == "colocate" else int(role["nodes"])
+            for role in roles.values()
+        )
+    raise ValueError(f"Recipe has no worker roles: {recipe_path}")
 
 
 def worker_node_count(
