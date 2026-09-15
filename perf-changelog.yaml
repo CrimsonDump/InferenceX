@@ -7680,3 +7680,14 @@
     - "Use lmsysorg/sglang:nightly-dev-20260910-00840301 with its bundled Dynamo 1.5.0.dev20260909, EAGLE speculative decoding, and 110 GB HiCache write-back DRAM offload per prefill rank."
     - "Allow up to 3600 seconds for NIXL UCX engine initialization in the 1P(DEP8)4D(TP4) configuration while registering its larger set of HiCache pools."
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/2995
+
+- config-keys:
+    - glm5.2-fp4-mi355x-sglang-agentic-mtp
+  scenario-type:
+    - agentic-coding
+  description:
+    - "Update the SGLang ROCm image from lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910 to lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260913. Enable the v2 fused top-k path for GLM-5.x on ROCm after sgl-project/sglang#36684 and #36851."
+    - "将 SGLang ROCm 镜像从 lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910 更新到 lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260913；在 sgl-project/sglang#36684 和 #36851 合入后，为 ROCm 上的 GLM-5.x 启用 v2 fused top-k 路径。"
+    - "Remove concurrency 1 and 2 from the TP4/EP4 HiCache arm so those low-concurrency points run only on TP8/EP1 with KV offloading disabled; keep TP4/EP4 HiCache DRAM offloading for concurrency 4, 8, 10, and 12."
+    - "从 TP4/EP4 HiCache arm 中移除并发 1 和 2，使这些低并发点仅使用关闭 KV offloading 的 TP8/EP1；TP4/EP4 的并发 4、8、10 和 12 继续使用 HiCache DRAM offloading。"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3081
