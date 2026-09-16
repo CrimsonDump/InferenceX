@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import copy
+import json
+import subprocess
+from urllib.parse import parse_qsl
 
 import pytest
 
@@ -59,14 +62,24 @@ def make_request_case(monkeypatch) -> dict:
         if path == "/actions/runs/123":
             return case["run"]
         if path == "/actions/workflows/run-sweep.yml/runs":
-            return {"workflow_runs": [case["run"]]}
+            return {"workflow_runs": [case["run"]], "total_count": 1}
         if path == "/actions/runs/123/artifacts":
             if callback := case.get("during_validation"):
                 callback()
-            return {"artifacts": case["artifacts"]}
+            return {"artifacts": case["artifacts"], "total_count": len(case["artifacts"])}
         raise AssertionError((method, path))
 
-    monkeypatch.setattr(acknowledgment.github, "api", api)
+    def run(args, **kwargs):
+        endpoint = next(arg for arg in args if arg.startswith("repos/"))
+        path, _, query = endpoint.split("/", 3)[3].partition("?")
+        response = api("example/project", "/" + path, kwargs["env"]["GH_TOKEN"],
+                       dict(parse_qsl(query)), method=args[args.index("--method") + 1],
+                       data=json.loads(kwargs["input"]) if kwargs["input"] else None)
+        if "--slurp" in args:
+            response = [response]
+        return subprocess.CompletedProcess(args, 0, json.dumps(response), "")
+
+    monkeypatch.setattr(acknowledgment.github.subprocess, "run", run)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     return case
 
