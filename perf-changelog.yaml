@@ -8032,3 +8032,10 @@
     - "配置键由 dsv4-fp4-mi355x-sglang-disagg-agentic-hicache-mtp 改名为 dsv4-fp4-mi355x-sglang-disagg-agentic-umbp-dspark，以反映 DSpark 算法与 UMBP-linker 分支；该配方此前的条目仍记录在旧键名下。改名不伴随任何其他字段变化。"
     - "Collect completed logs from every Slurm node so both prefill and decode artifacts are uploaded; forward workflow-owned AgentX fast-mode and power inputs, and supply the existing router port to evaluation."
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3188
+
+- config-keys:
+    - qwen3.5-fp8-h200-sglang-agentic-mtp
+  description:
+    - "Pin the Qwen3.5 FP8 H200 SGLang AgentX image to lmsysorg/sglang:v0.5.19-cu130@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9, replacing the 2026-09-14 nightly; recipe settings and the c4/8/12/16 grid are unchanged."
+    - "将 Qwen3.5 FP8 H200 SGLang AgentX 镜像从 2026-09-14 nightly 更新为按摘要固定的 lmsysorg/sglang:v0.5.19-cu130@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9；配方设置及 c4/8/12/16 网格保持不变。"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3198
