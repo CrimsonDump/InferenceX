@@ -8423,3 +8423,15 @@
     - "Enable required measured power for the complete H200 Kimi-K3 balanced recipe through the shared recipe-gated launcher."
     - "为 H200 Kimi-K3 balanced 完整配方启用必需实测功耗。"
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3053
+
+- config-keys:
+  - qwen3.5-fp8-b200-dynamo-sglang-agentic-disagg-mtp
+  scenario-type:
+  - agentic-coding
+  description:
+  - Add B200 Qwen3.5-397B-A17B FP8 AgentX disaggregation with colocated TP4 prefill
+    and TP4 decode on eight GPUs at concurrency 8, 16, 24, 32, 48 and 64.
+  - Use Dynamo/SGLang nightly 20260918-20518d85 with NEXTN MTP and Mooncake NVLink transfers.
+  - Enable 104 GB per-rank prefill HiCache at C8-C32; use 215 GB with first-use
+    write-through and decode static memory 0.88 at C48/C64.
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3269
