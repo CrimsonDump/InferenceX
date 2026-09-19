@@ -7925,6 +7925,14 @@
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3118
 
 - config-keys:
+    - glm5.2-fp4-mi355x-atom-agentic-mtp
+  scenario-type:
+    - agentic-coding
+  description:
+    - "Retune the GLM-5.2 FP4 MI355X ATOM AgentX recipe to the validated standalone recipe (ROCm/ATOM PR 2247). Image -> rocm/atom-dev:nightly_202609151450 (ATOM e03b7f17 / AITER 797cce25). Per-concurrency MTP draft depth with the golden acceptance length via --spec-decode-acceptance-length: K5/3.61 for C1-C8, K4/3.33 for C10-C40, K3/2.99 for C48. Add a TP4+DCP4 arm (dcp-size 4) at conc [16, 24, 32, 40, 48] to shard the decode KV. online-quant is global ptpc_fp8 with a 7-module exclude that keeps every MoE expert (layers 0-77, native MXFP4) and the whole MTP head (layer 78, native BF16) out of online quant, so only the dense attention/MLP Linears are re-quantized to ptpc_fp8. Add --gpu-memory-utilization 0.95, --enable_prefix_caching, ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=0, and LMCACHE_NUMA_MODE=auto. dram-utilization 0.14 -> 0.171 yields 256 GiB/rank LMCache (min(3095781,2861022)MiB*0.171*4/8). TP8 GPU-only arm unchanged."
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3205
+
+- config-keys:
     - dsv4-fp4-mi355x-sglang-agentic-mtp
   scenario-type:
     - agentic-coding
