@@ -38,6 +38,11 @@ export TILERT_ROLE
 
 source "$WS_PATH/setup_deps.sh"
 source "$WS_PATH/env.sh"
+# Before the library is sourced: it resolves AGENTIC_DIR and AIPERF_DIR from
+# this at file scope, so setting it later has no effect. job.slurm does not
+# forward the workflow's value into the container -- server_sglang.sh pins it
+# in the container env for the same reason. /workspace is the repo mount.
+export INFMAX_CONTAINER_WORKSPACE=/workspace
 source /workspace/benchmarks/benchmark_lib.sh
 
 # Model-specific engine environment (not caller configuration): the prefill
@@ -435,11 +440,6 @@ run_agentic_replay() {
     export MODEL="$MODEL_PATH"              # aiperf --tokenizer (local HF dir)
     export SERVED_MODEL_NAME                # aiperf --model (name the router/vLLM serve)
     check_env_vars DURATION RESULT_FILENAME
-    # benchmark_lib.sh resolves utils/agentic-benchmark and utils/aiperf under
-    # this, and job.slurm does not forward the workflow's value into the
-    # container -- server_sglang.sh pins it in the container env for the same
-    # reason. /workspace is where job.slurm mounts the repo.
-    export INFMAX_CONTAINER_WORKSPACE=/workspace
     export MAX_MODEL_LEN="$TILERT_MAX_MODEL_LEN"
     # TileRT decode exposes no /metrics route; only the vLLM prefill is scraped.
     export AIPERF_SERVER_METRICS_URLS="http://${PREFILL_HOST}:${PREFILL_PORT}/metrics"
