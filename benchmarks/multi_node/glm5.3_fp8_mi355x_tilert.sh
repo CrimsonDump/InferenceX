@@ -87,6 +87,9 @@ else
     export PREFILL_SPEC_TOKENS=0
 fi
 export TILERT_QUEUE_TIMEOUT=0
+# submit.sh and job.slurm validate KV_OFFLOADING, and the fixed-seq-len matrix
+# emits it only for agentic scenarios. TileRT has no KV offload backend.
+export KV_OFFLOADING=none
 
 if [[ "$PREFILL_EP" -ne 1 || "$DECODE_EP" -ne 1 || \
       "$PREFILL_DP_ATTN" == "true" || "$DECODE_DP_ATTN" == "true" ]]; then

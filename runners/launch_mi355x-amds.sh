@@ -87,6 +87,16 @@ if [[ "$IS_MULTINODE" == "true" ]]; then
     fi
     JOB_ID=$(bash "benchmarks/${BENCHMARK_SUBDIR}/${SCRIPT_NAME}")
 
+    # An empty JOB_ID means the recipe or submit.sh failed before sbatch. The
+    # wait loop below would then poll for slurm_job-.out forever, because its
+    # liveness guard degenerates to `grep -q ""` and matches any job this user
+    # has queued. Fail here instead of burning the job's whole time limit.
+    if [[ -z "${JOB_ID//[[:space:]]/}" ]]; then
+        echo "ERROR: benchmarks/${BENCHMARK_SUBDIR}/${SCRIPT_NAME} returned no Slurm job id;" \
+             "the recipe or submit.sh failed before sbatch (see its stderr above)" >&2
+        exit 1
+    fi
+
     LOG_FILE="$BENCHMARK_LOGS_DIR/slurm_job-${JOB_ID}.out"
 
     sleep 10
