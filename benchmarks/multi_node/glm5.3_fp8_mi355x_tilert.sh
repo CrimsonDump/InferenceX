@@ -47,9 +47,13 @@ fi
 
 # TileRT configuration. Every value is explicit here: server_tilert.sh
 # validates each one with check_env_vars and supplies no defaults of its own.
-# The workflow only sets KV_OFFLOADING for agentic scenarios, and submit.sh
-# requires it on every run. TileRT has no KV offload backend.
+# The workflow fills KV_OFFLOADING and DURATION for agentic scenarios only,
+# while submit.sh and job.slurm require both on every run. TileRT has no KV
+# offload backend, and a fixed-sequence run has no replay window: job.slurm
+# forwards DURATION without reading it, and server_tilert.sh only reads it
+# in the agentic path, so 0 is inert here.
 export KV_OFFLOADING=none
+export DURATION=0
 
 export TILERT_VERSION=0.1.6
 export TILERT_PROFILE=glm5_2          # decode_server --model (TileRT model profile)
