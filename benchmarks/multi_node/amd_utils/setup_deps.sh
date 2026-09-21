@@ -63,13 +63,12 @@ install_transformers_glm5() {
     _SETUP_INSTALLED+=("transformers-glm5")
 }
 
-TILERT_VERSION="${TILERT_VERSION:-0.1.6}"
-TILERT_PACKAGE="${TILERT_PACKAGE:-tilert}"
-TILERT_PIP_SPEC="${TILERT_PIP_SPEC:-$TILERT_PACKAGE==$TILERT_VERSION}"
-TILERT_PIP_INDEX_URL="${TILERT_PIP_INDEX_URL:-}"
-TILERT_HTTP_DEPS="${TILERT_HTTP_DEPS:-fastapi uvicorn httpx}"
-TILERT_TRANSPORT_DEPS="${TILERT_TRANSPORT_DEPS:-mooncake-transfer-engine-rocm>=0.3.13}"
-TILERT_TRANSFORMERS_SPEC="${TILERT_TRANSFORMERS_SPEC:-transformers>=4.56}"
+# Pinned by the recipe (TILERT_VERSION); the rest are fixed properties of the
+# TileRT 0.1.x runtime rather than caller configuration.
+TILERT_PACKAGE=tilert
+TILERT_HTTP_DEPS="fastapi uvicorn httpx"
+TILERT_TRANSPORT_DEPS="mooncake-transfer-engine-rocm>=0.3.13"
+TILERT_TRANSFORMERS_SPEC="transformers>=4.56"
 
 _tilert_resolve_python() {
     if [[ -n "${PY:-}" ]] && command -v "$PY" >/dev/null 2>&1; then :; else
@@ -94,9 +93,7 @@ PYEOF
 }
 
 _tilert_pip() {
-    local a=(-m pip install --quiet --no-cache-dir)
-    [[ -n "$TILERT_PIP_INDEX_URL" ]] && a+=(--index-url "$TILERT_PIP_INDEX_URL")
-    "$PY" "${a[@]}" "$@"
+    "$PY" -m pip install --quiet --no-cache-dir "$@"
 }
 
 _tilert_install_missing() {
@@ -186,6 +183,8 @@ if [[ "$ENGINE" == "vllm-disagg" ]]; then
     export PATH="${UCX_HOME}/bin:/usr/local/bin/etcd:/root/.cargo/bin:${PATH}"
     export LD_LIBRARY_PATH="${UCX_HOME}/lib:${RIXL_HOME}/lib:${RIXL_HOME}/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 elif [[ "$ENGINE" == "tilert" ]]; then
+    check_env_vars TILERT_VERSION
+    TILERT_PIP_SPEC="$TILERT_PACKAGE==$TILERT_VERSION"
     _tilert_resolve_python
     case "${TILERT_ROLE:-}" in
         decode)  install_tilert_decode ;;

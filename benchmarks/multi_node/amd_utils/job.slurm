@@ -59,7 +59,6 @@ if [[ "$ENGINE" == "tilert" && -z "${PREFILL_IMAGE:-}" ]]; then
     exit 1
 fi
 
-MODEL_NAME="${MODEL_NAME:-None}"
 # Resolve the models.yaml entry the same way server_sglang.sh does: agentic runs
 # (IS_AGENTIC) use the '<model>-AgentX' recipe, non-agentic disaggregated runs use
 # '<model>-DI'. Fall back to the bare model name if the variant key is absent.
@@ -534,25 +533,34 @@ elif [[ "$ENGINE" == "tilert" ]]; then
     DOCKER_ENV_ENGINE=(
         -e MODEL_PATH=$DOCKER_MODEL_PATH
         -e PREFILL_IMAGE=${PREFILL_IMAGE}
-        -e TILERT_VERSION=${TILERT_VERSION:-}
-        -e TILERT_PIP_SPEC=${TILERT_PIP_SPEC:-}
-        -e TILERT_PIP_INDEX_URL=${TILERT_PIP_INDEX_URL:-}
-        -e TILERT_PROFILE=${TILERT_PROFILE:-}
-        -e TILERT_MODEL_TYPE=${TILERT_MODEL_TYPE:-}
-        -e TILERT_MAX_MODEL_LEN=${TILERT_MAX_MODEL_LEN:-}
-        -e TILERT_TRANSPORT=${TILERT_TRANSPORT:-}
-        -e PREFILL_KV_DTYPE=${PREFILL_KV_DTYPE:-}
-        -e DECODE_KV_DTYPE=${DECODE_KV_DTYPE:-}
-        -e TILERT_PARSER=${TILERT_PARSER:-}
-        -e TILERT_QUEUE_TIMEOUT=${TILERT_QUEUE_TIMEOUT:-}
-        -e TILERT_WEIGHTS_DIR=${TILERT_WEIGHTS_DIR:-}
-        -e TILERT_RDMA_STRICT=${TILERT_RDMA_STRICT:-0}
+        -e TILERT_VERSION=${TILERT_VERSION}
+        -e TILERT_PROFILE=${TILERT_PROFILE}
+        -e TILERT_MODEL_TYPE=${TILERT_MODEL_TYPE}
+        -e TILERT_MODEL_PKG=${TILERT_MODEL_PKG}
+        -e TILERT_MAX_MODEL_LEN=${TILERT_MAX_MODEL_LEN}
+        -e TILERT_TRANSPORT=${TILERT_TRANSPORT}
+        -e TILERT_PARSER=${TILERT_PARSER}
+        -e TILERT_QUEUE_TIMEOUT=${TILERT_QUEUE_TIMEOUT}
+        -e TILERT_WEIGHTS_DIR=${TILERT_WEIGHTS_DIR}
+        -e TILERT_RDMA_STRICT=${TILERT_RDMA_STRICT}
+        -e TILERT_CONVERT_LOCK_WAIT=${TILERT_CONVERT_LOCK_WAIT}
+        -e TILERT_SIMULATE_ACC_METHOD=${TILERT_SIMULATE_ACC_METHOD}
         -e \"TILERT_EXTRA_ENV=${TILERT_EXTRA_ENV:-}\"
-        -e GPU_MEM_UTIL=${GPU_MEM_UTIL:-}
-        -e ROUTER_PORT=${ROUTER_PORT:-30000}
-        -e PREFILL_PORT=${PREFILL_PORT:-8000}
-        -e DECODE_CTRL_PORT=${DECODE_CTRL_PORT:-5556}
-        -e DECODE_HTTP_PORT=${DECODE_HTTP_PORT:-5557}
+        -e SERVED_MODEL_NAME=${SERVED_MODEL_NAME}
+        -e PREFILL_KV_DTYPE=${PREFILL_KV_DTYPE}
+        -e PREFILL_BLOCK_SIZE=${PREFILL_BLOCK_SIZE}
+        -e PREFILL_SPEC_TOKENS=${PREFILL_SPEC_TOKENS}
+        -e DECODE_KV_DTYPE=${DECODE_KV_DTYPE}
+        -e GPU_MEM_UTIL=${GPU_MEM_UTIL}
+        -e PREFILL_PORT=${PREFILL_PORT}
+        -e DECODE_CTRL_PORT=${DECODE_CTRL_PORT}
+        -e DECODE_HTTP_PORT=${DECODE_HTTP_PORT}
+        -e DECODE_WAIT=${DECODE_WAIT}
+        -e PREFILL_WAIT=${PREFILL_WAIT}
+        -e ROUTER_WAIT=${ROUTER_WAIT}
+        -e SKIP_CONTAINER_BARRIER=${SKIP_CONTAINER_BARRIER}
+        # Golden-acceptance selection on agentic MTP runs; unset elsewhere.
+        -e THINKING_MODE=${THINKING_MODE:-}
         -e IBDEVICES=${IBDEVICES:-}
         -e PYTHONPYCACHEPREFIX=/tmp/pycache
     )

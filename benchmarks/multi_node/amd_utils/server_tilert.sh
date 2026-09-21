@@ -1,28 +1,28 @@
 #!/bin/bash
+# TileRT disaggregated launcher: upstream vLLM ROCm prefill (TileRTConnector,
+# kv_producer) + TileRT decode_server + the OpenAI-compatible pd_router.
+# Every value below is supplied by the recipe through job.slurm; this script
+# validates them and never invents a default for caller-owned configuration.
 
-NODE0_ADDR="${NODE0_ADDR:-localhost}"
-NODE_RANK="${NODE_RANK:-0}"
-MODEL_DIR="${MODEL_DIR:-/models}"
-MODEL_NAME="${MODEL_NAME:-}"
-xP="${xP:-1}"
-yD="${yD:-1}"
-IPADDRS="${IPADDRS:-localhost}"
-DRY_RUN="${DRY_RUN:-0}"
-GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
-PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-$GPUS_PER_NODE}"
-DECODE_TP_SIZE="${DECODE_TP_SIZE:-$GPUS_PER_NODE}"
+source "$(dirname "${BASH_SOURCE[0]}")/../../benchmark_lib.sh" --validation-only
 
-BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-1024}"
-BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-1024}"
-BENCH_RANDOM_RANGE_RATIO="${BENCH_RANDOM_RANGE_RATIO:-1}"
-BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-inf}"
-BENCH_NUM_PROMPTS_MULTIPLIER="${BENCH_NUM_PROMPTS_MULTIPLIER:-10}"
-BENCH_MAX_CONCURRENCY="${BENCH_MAX_CONCURRENCY:-1}"
+check_env_vars \
+    NODE0_ADDR NODE_RANK MODEL_DIR MODEL_NAME MODEL_PATH xP yD IPADDRS \
+    DRY_RUN GPUS_PER_NODE PREFILL_TP_SIZE DECODE_TP_SIZE \
+    BENCH_INPUT_LEN BENCH_OUTPUT_LEN BENCH_RANDOM_RANGE_RATIO \
+    BENCH_REQUEST_RATE BENCH_NUM_PROMPTS_MULTIPLIER BENCH_MAX_CONCURRENCY \
+    RUN_EVAL EVAL_ONLY EVAL_FRAMEWORK BENCHMARK_LOGS_DIR WS_PATH \
+    SLURM_JOB_ID SPEC_DECODING \
+    TILERT_PROFILE TILERT_MODEL_TYPE TILERT_MODEL_PKG TILERT_MAX_MODEL_LEN \
+    TILERT_TRANSPORT TILERT_PARSER TILERT_QUEUE_TIMEOUT TILERT_WEIGHTS_DIR \
+    TILERT_RDMA_STRICT TILERT_CONVERT_LOCK_WAIT TILERT_SIMULATE_ACC_METHOD \
+    PREFILL_KV_DTYPE PREFILL_BLOCK_SIZE PREFILL_SPEC_TOKENS DECODE_KV_DTYPE \
+    DECODE_MTP_SIZE GPU_MEM_UTIL SERVED_MODEL_NAME \
+    DECODE_CTRL_PORT DECODE_HTTP_PORT PREFILL_PORT ROUTER_PORT \
+    DECODE_WAIT PREFILL_WAIT ROUTER_WAIT SKIP_CONTAINER_BARRIER
 
-MODEL_PATH="${MODEL_PATH:-${MODEL_DIR}/${MODEL_NAME}}"
-
-LOG_DIR="/run_logs/slurm_job-${SLURM_JOB_ID:-local}"
-SHARED_LOG_DIR="${BENCHMARK_LOGS_DIR:-/run_logs}/logs/slurm_job-${SLURM_JOB_ID:-local}"
+LOG_DIR="/run_logs/slurm_job-${SLURM_JOB_ID}"
+SHARED_LOG_DIR="${BENCHMARK_LOGS_DIR}/logs/slurm_job-${SLURM_JOB_ID}"
 mkdir -p "$LOG_DIR"
 
 if [[ "$xP" -ne 1 || "$yD" -ne 1 ]]; then
@@ -38,79 +38,37 @@ export TILERT_ROLE
 
 source "$WS_PATH/setup_deps.sh"
 source "$WS_PATH/env.sh"
-PY="${PY:-python3}"
-
 source /workspace/benchmarks/benchmark_lib.sh
 
+# Model-specific engine environment (not caller configuration): the prefill
+# vLLM env block lives with the model, exactly as models_atom.yaml carries the
+# ATOM `env` string. Everything else is passed in by the recipe.
 MODELS_YAML="${WS_PATH}/models_tilert.yaml"
-if [[ -f "$MODELS_YAML" ]] && "$PY" -c "import yaml" 2>/dev/null; then
-    eval "$("$PY" - "$MODELS_YAML" "$MODEL_NAME" <<'PYEOF'
+eval "$("$PY" - "$MODELS_YAML" "$MODEL_NAME" <<'PYEOF'
 import shlex, sys, yaml
 path, name = sys.argv[1], sys.argv[2]
 with open(path) as f:
     models = yaml.safe_load(f) or {}
-m = models.get(name) or {}
-keys = {
-    "profile": "TILERT_PROFILE",
-    "model_type": "TILERT_MODEL_TYPE",
-    "max_model_len": "TILERT_MAX_MODEL_LEN",
-    "prefill_extra_flags": "TILERT_PREFILL_EXTRA_FLAGS",
-    "prefill_env": "TILERT_PREFILL_ENV",
-    "decode_extra_flags": "TILERT_DECODE_EXTRA_FLAGS",
-}
-for k, var in keys.items():
-    if k not in m or m[k] is None:
-        continue
-    val = str(m[k])
-    if val == "":
-        continue
-    print(f'if [[ -z "${{{var}:-}}" ]]; then {var}={shlex.quote(val)}; fi')
+if name not in models:
+    sys.exit(f"model '{name}' is not present in {path}")
+m = models[name] or {}
+for key, var in (("prefill_env", "TILERT_PREFILL_ENV"),
+                 ("prefill_extra_flags", "TILERT_PREFILL_EXTRA_FLAGS"),
+                 ("decode_extra_flags", "TILERT_DECODE_EXTRA_FLAGS")):
+    print(f"{var}={shlex.quote(str(m.get(key) or ''))}")
 PYEOF
-)"
-    echo "[tilert] loaded model defaults for '$MODEL_NAME' from $MODELS_YAML"
-else
-    echo "[tilert] $MODELS_YAML not readable (missing file or PyYAML); using built-in defaults"
-fi
+)" || { echo "ERROR: cannot read the tilert model entry for '$MODEL_NAME' from $MODELS_YAML" >&2; exit 1; }
+echo "[tilert] model entry '$MODEL_NAME' loaded from $MODELS_YAML"
 
-TILERT_PROFILE="${TILERT_PROFILE:-glm5_2}"          # decode_server --model (TileRT model profile)
-TILERT_MODEL_TYPE="${TILERT_MODEL_TYPE:-glm-5}"      # weight_converter --model_type
-TILERT_MODEL_PKG="${TILERT_MODEL_PKG:-glm_5_2_rocm}"
-TILERT_MAX_MODEL_LEN="${TILERT_MAX_MODEL_LEN:-${MAX_MODEL_LEN:-202752}}"
-TILERT_TRANSPORT="${TILERT_TRANSPORT:-mooncake}"     # decode --transport / connector tilert_transport
-PREFILL_KV_DTYPE="${PREFILL_KV_DTYPE:-auto}"
-PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-64}"
-DECODE_KV_DTYPE="${DECODE_KV_DTYPE:-bf16}"
-TILERT_PARSER="${TILERT_PARSER:-none}"
-if [[ "${IS_AGENTIC:-0}" == "1" || "${IS_AGENTIC:-}" == "true" || "${SCENARIO_TYPE:-}" == "agentic-coding" ]]; then
-    TILERT_QUEUE_TIMEOUT="${TILERT_QUEUE_TIMEOUT:-600}"
-else
-    TILERT_QUEUE_TIMEOUT="${TILERT_QUEUE_TIMEOUT:-0}"
-fi
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.75}"
-TILERT_PREFILL_EXTRA_FLAGS="${TILERT_PREFILL_EXTRA_FLAGS:-}"
-TILERT_DECODE_EXTRA_FLAGS="${TILERT_DECODE_EXTRA_FLAGS:-}"
-TILERT_PREFILL_ENV="${TILERT_PREFILL_ENV:-}"
-TILERT_EXTRA_ENV="${TILERT_EXTRA_ENV:-}"
-
-DECODE_CTRL_PORT="${DECODE_CTRL_PORT:-5556}"
-DECODE_HTTP_PORT="${DECODE_HTTP_PORT:-5557}"
-PREFILL_PORT="${PREFILL_PORT:-8000}"
-ROUTER_PORT="${ROUTER_PORT:-30000}"
 export ROUTER_PORT
-
-DECODE_WAIT="${DECODE_WAIT:-7200}"     # prefill waits for decode ctrl port (weights conversion + load)
-PREFILL_WAIT="${PREFILL_WAIT:-3600}"   # prefill waits for its own vLLM port
-ROUTER_WAIT="${ROUTER_WAIT:-10800}"    # decode waits for the router port to open
-
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$TILERT_PROFILE}"
 export SERVED_MODEL_NAME
-
-TILERT_WEIGHTS_DIR="${TILERT_WEIGHTS_DIR:-${MODEL_DIR}/${MODEL_NAME}-tilert-tp${DECODE_TP_SIZE}}"
 
 PREFILL_SPEC=()
 DECODE_MTP=()
-if [[ "${SPEC_DECODING:-}" == "mtp" ]]; then
-    PREFILL_SPEC=(--speculative-config '{"method":"mtp","num_speculative_tokens":1}')
+if [[ "$SPEC_DECODING" == "mtp" ]]; then
+    # The prefill rank only has to build the MTP layer's KV; TileRT decode owns
+    # the draft depth (DECODE_MTP_SIZE), so the two counts differ by design.
+    PREFILL_SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${PREFILL_SPEC_TOKENS}}")
     DECODE_MTP=(--with-mtp)
 fi
 
@@ -131,7 +89,7 @@ host_name=$(hostname)
 
 echo "[tilert] ROLE=$TILERT_ROLE rank=$NODE_RANK host=$host_name ($host_ip)"
 echo "[tilert] PREFILL_HOST=$PREFILL_HOST:$PREFILL_PORT  DECODE_HOST=$DECODE_HOST:$DECODE_CTRL_PORT/$DECODE_HTTP_PORT  ROUTER=:$ROUTER_PORT"
-echo "[tilert] MODEL_PATH=$MODEL_PATH  profile=$TILERT_PROFILE  served=$SERVED_MODEL_NAME  max_len=$TILERT_MAX_MODEL_LEN  transport=$TILERT_TRANSPORT  kv=${PREFILL_KV_DTYPE}->${DECODE_KV_DTYPE}  mtp=${SPEC_DECODING:-none}  agentic=$TILERT_IS_AGENTIC"
+echo "[tilert] MODEL_PATH=$MODEL_PATH  profile=$TILERT_PROFILE  served=$SERVED_MODEL_NAME  max_len=$TILERT_MAX_MODEL_LEN  transport=$TILERT_TRANSPORT  kv=${PREFILL_KV_DTYPE}->${DECODE_KV_DTYPE}  mtp=${SPEC_DECODING}  agentic=$TILERT_IS_AGENTIC"
 
 for env_pair in ${TILERT_EXTRA_ENV}; do
     export "${env_pair?}"
@@ -174,7 +132,7 @@ rdma_preflight() {
     if command -v ibv_devices >/dev/null 2>&1; then
         echo "[rdma] ibv_devices:"; ibv_devices 2>&1 | sed 's/^/[rdma]   /'
     fi
-    if (( warn )) && [[ "${TILERT_RDMA_STRICT:-0}" == "1" ]]; then
+    if (( warn )) && [[ "$TILERT_RDMA_STRICT" == "1" ]]; then
         echo "[rdma] TILERT_RDMA_STRICT=1 and preflight did not fully pass -- aborting" >&2
         return 1
     fi
@@ -218,7 +176,7 @@ convert_weights() {
     fi
     mkdir -p "$TILERT_WEIGHTS_DIR" || { echo "[weight_converter] ERROR: cannot create $TILERT_WEIGHTS_DIR (set TILERT_WEIGHTS_DIR to a writable shared path)" >&2; return 1; }
     exec 9>"$TILERT_WEIGHTS_DIR/.convert.lock"
-    flock -w "${TILERT_CONVERT_LOCK_WAIT:-21600}" 9 || {
+    flock -w "$TILERT_CONVERT_LOCK_WAIT" 9 || {
         echo "[weight_converter] timed out waiting for the conversion lock (another job still converting?)" >&2; return 1; }
     if _tilert_weights_cached; then
         echo "[weight_converter] cache produced by a concurrent job, skipping conversion"; exec 9>&-; return 0
@@ -233,7 +191,7 @@ convert_weights() {
         conv_mod="tilert.models.${TILERT_MODEL_PKG}.weight_converter"
         conv_args=(--model_dir "$MODEL_PATH" --save_dir "$TILERT_WEIGHTS_DIR"
                    --device "${TILERT_CONVERT_DEVICE:-cuda:$((GPUS_PER_NODE - 1))}")
-        [[ "${SPEC_DECODING:-}" == "mtp" ]] && conv_args+=(--num_mtp "${TILERT_NUM_MTP:-3}")
+        [[ "$SPEC_DECODING" == "mtp" ]] && conv_args+=(--num_mtp "$DECODE_MTP_SIZE")
     else
         conv_mod="tilert.models.preprocess.weight_converter"
         conv_args=(--model_type "$TILERT_MODEL_TYPE" --model_dir "$MODEL_PATH" --save_dir "$TILERT_WEIGHTS_DIR")
@@ -257,10 +215,11 @@ convert_weights() {
 start_decode() {
     # shellcheck disable=SC2206
     local extra=( ${TILERT_DECODE_EXTRA_FLAGS} )
-    if [[ "$TILERT_IS_AGENTIC" == "1" && "${SPEC_DECODING:-}" == "mtp" \
-          && "${EVAL_ONLY:-false}" != "true" && "${RUN_EVAL:-false}" != "true" ]]; then
-        local curve="${TILERT_GOLDEN_AL_FILE:-${WS_PATH%/benchmarks/*}/golden_al_distribution/${MODEL_PREFIX:-glm5.3}_mtp.yaml}"
-        TILERT_SIMULATE_ACC_LEN="$("$PY" - "$curve" "${TILERT_THINKING_MODE:-thinking_on}" "${TILERT_NUM_MTP:-3}" <<'PYEOF'
+    if [[ "$TILERT_IS_AGENTIC" == "1" && "$SPEC_DECODING" == "mtp" \
+          && "$EVAL_ONLY" != "true" && "$RUN_EVAL" != "true" ]]; then
+        check_env_vars MODEL_PREFIX THINKING_MODE
+        local curve="${WS_PATH%/benchmarks/*}/golden_al_distribution/${MODEL_PREFIX}_mtp.yaml"
+        TILERT_SIMULATE_ACC_LEN="$("$PY" - "$curve" "$THINKING_MODE" "$DECODE_MTP_SIZE" <<'PYEOF'
 import sys, yaml
 path, thinking, tokens = sys.argv[1], sys.argv[2], int(sys.argv[3])
 data = yaml.safe_load(open(path))
@@ -276,12 +235,12 @@ if not 1 <= value <= tokens + 1:
 print(f"{value:g}")
 PYEOF
 )" || { echo "[tilert] ERROR: golden AL lookup failed (curve=$curve)" >&2; exit 1; }
-        echo "[tilert] golden AL ${TILERT_SIMULATE_ACC_LEN} from $(basename "$curve") (thinking_on, K=${TILERT_NUM_MTP:-3})"
+        echo "[tilert] golden AL ${TILERT_SIMULATE_ACC_LEN} from $(basename "$curve") ($THINKING_MODE, K=${DECODE_MTP_SIZE})"
     fi
 
-    if [[ -n "${TILERT_SIMULATE_ACC_LEN:-}" && "${EVAL_ONLY:-false}" != "true" ]]; then
+    if [[ -n "${TILERT_SIMULATE_ACC_LEN:-}" && "$EVAL_ONLY" != "true" ]]; then
         export TILERT_SIMULATE_ACC_LEN
-        export TILERT_SIMULATE_ACC_METHOD="${TILERT_SIMULATE_ACC_METHOD:-match-expected}"
+        export TILERT_SIMULATE_ACC_METHOD
         echo "[decode] simulated acceptance: TILERT_SIMULATE_ACC_LEN=${TILERT_SIMULATE_ACC_LEN}" \
              "method=${TILERT_SIMULATE_ACC_METHOD} (output text is meaningless by design)"
     else
@@ -381,7 +340,7 @@ run_bench_and_eval() {
     local decode_gpus=$(( DECODE_TP_SIZE * yD ))
     export TRANSFORMERS_VERBOSITY=error TOKENIZERS_PARALLELISM=false
 
-    if [[ "${EVAL_ONLY:-false}" == "true" ]]; then
+    if [[ "$EVAL_ONLY" == "true" ]]; then
         echo "EVAL_ONLY mode: skipping throughput benchmark"
     else
         local conc np export_file
@@ -405,7 +364,7 @@ run_bench_and_eval() {
         done
     fi
 
-    if [[ "${RUN_EVAL:-false}" == "true" ]]; then
+    if [[ "$RUN_EVAL" == "true" ]]; then
         run_lm_eval_on_router || rc=1
     fi
     return $rc
@@ -429,10 +388,10 @@ run_lm_eval_on_router() {
     else
         export EVAL_CONCURRENT_REQUESTS=$(echo "$BENCH_MAX_CONCURRENCY" | tr 'x' '\n' | sort -n | tail -1)
     fi
-    export MODEL="${MODEL:-$MODEL_PATH}"
-    export MAX_MODEL_LEN="${MAX_MODEL_LEN:-$TILERT_MAX_MODEL_LEN}"
+    export MODEL="$MODEL_PATH"
+    export MAX_MODEL_LEN="$TILERT_MAX_MODEL_LEN"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        echo "DRY RUN: run_eval --port $ROUTER_PORT (framework=${EVAL_FRAMEWORK:-lm-eval}, conc=${EVAL_CONCURRENT_REQUESTS})"
+        echo "DRY RUN: run_eval --port $ROUTER_PORT (framework=${EVAL_FRAMEWORK}, conc=${EVAL_CONCURRENT_REQUESTS})"
     else
         run_eval --port "$ROUTER_PORT"
         local eval_rc=$?
@@ -467,13 +426,14 @@ run_agentic_replay() {
     export PORT="$ROUTER_PORT"
     export MODEL="$MODEL_PATH"              # aiperf --tokenizer (local HF dir)
     export SERVED_MODEL_NAME                # aiperf --model (name the router/vLLM serve)
-    export DURATION="${DURATION:-1800}"
+    check_env_vars DURATION RESULT_FILENAME
     export MAX_MODEL_LEN="$TILERT_MAX_MODEL_LEN"
-    export AIPERF_SERVER_METRICS_URLS="${AIPERF_SERVER_METRICS_URLS:-http://${PREFILL_HOST}:${PREFILL_PORT}/metrics}"
+    # TileRT decode exposes no /metrics route; only the vLLM prefill is scraped.
+    export AIPERF_SERVER_METRICS_URLS="http://${PREFILL_HOST}:${PREFILL_PORT}/metrics"
     export TRANSFORMERS_VERBOSITY=error TOKENIZERS_PARALLELISM=false
 
     local result_dir="$LOG_DIR/agentic"
-    local result_filename_base="${RESULT_FILENAME:-agentic_bench}"
+    local result_filename_base="$RESULT_FILENAME"
     mkdir -p "$result_dir"
 
     resolve_trace_source
@@ -504,7 +464,7 @@ run_agentic_replay() {
 echo "Waiting at the container creation barrier on $host_name"
 if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "DRY RUN: skipping container creation barrier"
-elif [[ "${SKIP_CONTAINER_BARRIER:-0}" == "1" ]]; then
+elif [[ "$SKIP_CONTAINER_BARRIER" == "1" ]]; then
     echo "SKIP_CONTAINER_BARRIER=1: caller asserts all containers are up"
 else
     "$PY" "$WS_PATH/sync.py" barrier \
@@ -550,7 +510,7 @@ case "$TILERT_ROLE" in
         echo "NODE INFO ======================================="
         echo "Node List : ${SLURM_JOB_NODELIST:-}"
         echo "Node IPs  : ${IPADDRS}"
-        echo "Model     : ${MODEL_NAME:-'Not specified'}"
+        echo "Model     : ${MODEL_NAME}"
         echo "${host_name}:${host_ip} is the Prefill Node (vLLM + TileRTConnector) and Router Node"
         echo "================================================"
         rdma_preflight || exit 1
