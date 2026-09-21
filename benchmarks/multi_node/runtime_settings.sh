@@ -55,6 +55,29 @@ case "$FRAMEWORK" in
         export TILERT_RDMA_STRICT=0 TILERT_CONVERT_LOCK_WAIT=21600 TILERT_DECODE_DRAIN=60
         export TILERT_VERSION=0.1.5.post3 TILERT_HTTP_DEPS='fastapi uvicorn httpx' TILERT_NIXL_VERSION=1.3.1
         export B200_SQUASH_DIR=/home/sa-shared/containers
+        # The amd_utils chain (submit.sh, job.slurm, env.sh, setup_deps.sh,
+        # preflight_node.sh) validates the MoRI/UCX/vllm-router preconditions
+        # for every framework, and the only place they are assigned is the
+        # sglang-disagg|vllm-disagg|atom-disagg arm above, which tilert never
+        # reaches. Every one of them is gated at its point of use by
+        # ENGINE == vllm-disagg or by server_sglang.sh, so nothing below is
+        # read on the tilert path; these values exist to satisfy the checks.
+        # The exceptions are SKIP_RDMA_CHECK and SKIP_GPU_SANITY, which are
+        # honoured for all engines -- both are 0 so the platform's own
+        # pre-flight still runs, as it does for the other AMD frameworks.
+        export ROCM_PATH=/opt/rocm UCX_HOME=/usr/local/ucx RIXL_HOME=/usr/local/rixl
+        export SKIP_RDMA_CHECK=0 SKIP_GPU_SANITY=0
+        export ROUTER_TYPE=tilert-pd-router VLLM_ROUTER_IMAGE=unused
+        export PROXY_PING_PORT=36367 HEADNODE_PORT=20000 SERVER_PORT=2584
+        export ENABLE_METRICS=0 PREFILL_ROUTER_POLICY=random DECODE_ROUTER_POLICY=random
+        export MORI_IO_SQ_BACKOFF_TIMEOUT_US=50000 MORI_IO_QP_MAX_SEND_WR=16384
+        export MORI_IO_QP_MAX_CQE=32768 MORI_IO_QP_MAX_SGE=2 MORI_IO_TC_DISABLE=0
+        export UCX_IB_GID_INDEX=1 MORI_APP_LOG_LEVEL=WARNING SGLANG_ROUTER_STDOUT_LOGS=0
+        export SGLANG_OPT_USE_AITER_INDEXER=false
+        # 0 is the stock behaviour. The sglang arm sets 1 to work around a ROCm
+        # graph-capture bug in its own decode path; TileRT does not capture
+        # graphs there, and every measurement so far was taken without it.
+        export TORCH_NCCL_BLOCKING_WAIT=0 NCCL_BLOCKING_WAIT=0
         if [[ "$IS_AGENTIC" == 1 || "$IS_AGENTIC" == true ]]; then
             export TILERT_QUEUE_TIMEOUT=1800
         fi
