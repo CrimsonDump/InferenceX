@@ -8474,3 +8474,19 @@
     - "Same two-image recipe as glm5.3-fp8-mi355x-tilert (decode ghcr.io/tile-ai/tilert-rocm-decode:0.1.6, prefill ghcr.io/tile-ai/tilert-rocm-prefill:0.1.6, tilert==0.1.6 pip-installed into both at container start), bf16 KV cache on both roles, kv-p2p-transfer: mooncake, kv-offloading none."
     - "The pd_router runs with --parser none and a 1800-second queue timeout so requests wait on the bs=1 decode engine instead of failing fast; AgentX traces are filtered at the 1048576-token full GLM context both roles are launched with; AIPerf scrapes only the vLLM prefill Prometheus endpoint (TileRT decode exposes no /metrics route)."
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3330
+
+- config-keys:
+    - glm5.3-fp8-mi355x-tilert
+  description:
+    - "Set RDMAV_FORK_SAFE=1 in the shared TileRT launcher for both prefill and decode ranks before verbs initialization, preventing silent RDMA-to-TCP fallback that degrades KV-transfer latency and TTFT; TPOT is unaffected. Ported from CrimsonDump/InferenceX commit 9e745f3697b360992e37747b53fac5e928cfa709."
+    - "在 TileRT 共享启动脚本中，为 prefill 和 decode 两侧在 verbs 初始化前设置 RDMAV_FORK_SAFE=1，避免静默从 RDMA 回退到 TCP 导致 KV 传输延迟和 TTFT 恶化；TPOT 不受影响。移植自 CrimsonDump/InferenceX 提交 9e745f3697b360992e37747b53fac5e928cfa709。"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3330
+
+- config-keys:
+    - glm5.3-fp8-mi355x-tilert-agentic
+  scenario-type:
+    - agentic-coding
+  description:
+    - "Set RDMAV_FORK_SAFE=1 on both TileRT ranks for AgentX, preventing silent RDMA-to-TCP fallback that degrades KV-transfer latency and TTFT; TPOT is unaffected."
+    - "为 AgentX 的 TileRT 两侧设置 RDMAV_FORK_SAFE=1，避免静默从 RDMA 回退到 TCP 导致 KV 传输延迟和 TTFT 恶化；TPOT 不受影响。"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3330
