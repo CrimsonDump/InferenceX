@@ -433,6 +433,11 @@ run_agentic_replay() {
     export MODEL="$MODEL_PATH"              # aiperf --tokenizer (local HF dir)
     export SERVED_MODEL_NAME                # aiperf --model (name the router/vLLM serve)
     check_env_vars DURATION RESULT_FILENAME
+    # The replay runs in this container, where the repo is bind-mounted at
+    # /workspace, so benchmark_lib's agentic helpers need the workspace root
+    # here. The SGLang path sets it in the separate client container's env file,
+    # and the launcher only exports it for the DSv4.1-Flash single-node branch.
+    export INFMAX_CONTAINER_WORKSPACE=/workspace
     export MAX_MODEL_LEN="$TILERT_MAX_MODEL_LEN"
     # TileRT decode exposes no /metrics route; only the vLLM prefill is scraped.
     export AIPERF_SERVER_METRICS_URLS="http://${PREFILL_HOST}:${PREFILL_PORT}/metrics"
