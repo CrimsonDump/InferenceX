@@ -66,7 +66,9 @@ export TILERT_PROFILE=glm5_2          # decode_server --model (TileRT model prof
 export TILERT_MODEL_TYPE=glm-5        # weight_converter --model_type (fallback converter)
 export TILERT_MODEL_PKG=glm_5_2_rocm  # per-model converter package, preferred when importable
 export SERVED_MODEL_NAME=glm5_2
-export TILERT_MAX_MODEL_LEN=202752
+# GLM-5.3's full context window, as every in-tree GLM-5.2 recipe uses.
+# (202752 is GLM-5.1's, inherited from the B200 TileRT recipe this mirrors.)
+export TILERT_MAX_MODEL_LEN=1048576
 export TILERT_TRANSPORT=mooncake
 export TILERT_PARSER=none
 export TILERT_RDMA_STRICT=0
