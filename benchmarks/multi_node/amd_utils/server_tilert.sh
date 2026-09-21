@@ -91,13 +91,6 @@ echo "[tilert] ROLE=$TILERT_ROLE rank=$NODE_RANK host=$host_name ($host_ip)"
 echo "[tilert] PREFILL_HOST=$PREFILL_HOST:$PREFILL_PORT  DECODE_HOST=$DECODE_HOST:$DECODE_CTRL_PORT/$DECODE_HTTP_PORT  ROUTER=:$ROUTER_PORT"
 echo "[tilert] MODEL_PATH=$MODEL_PATH  profile=$TILERT_PROFILE  served=$SERVED_MODEL_NAME  max_len=$TILERT_MAX_MODEL_LEN  transport=$TILERT_TRANSPORT  kv=${PREFILL_KV_DTYPE}->${DECODE_KV_DTYPE}  mtp=${SPEC_DECODING}  agentic=$TILERT_IS_AGENTIC"
 
-# Both roles, before any verbs context exists. Without it ibv_fork_init() fails
-# inside the container with "fork compatibility: Invalid argument" while the
-# transport's initialize() still returns 0, so mooncake finds no usable HCA and
-# both ranks fall back to TCP without an error. KV then moves at roughly a
-# twentieth of the link rate and only the latency numbers show it.
-export RDMAV_FORK_SAFE=1
-
 for env_pair in ${TILERT_EXTRA_ENV}; do
     export "${env_pair?}"
     echo "[tilert][EXTRA_ENV] $env_pair"
