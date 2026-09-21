@@ -1,0 +1,8 @@
+
+GLM-5.3:
+  profile: "glm5_2"
+  model_type: "glm-5_2"
+  max_model_len: 202752
+  prefill_extra_flags: ""
+  prefill_env: "VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MOE=1 VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1 VLLM_ENGINE_READY_TIMEOUT_S=10800"
+  decode_extra_flags: ""

@@ -74,9 +74,8 @@ if [[ "$IS_MULTINODE" == "true" ]]; then
     fi
 
     SCRIPT_NAME="${EXP_NAME%%_*}_${PRECISION}_mi355x_${FRAMEWORK}.sh"
-    if [[ "$FRAMEWORK" == "sglang-disagg" ]] || [[ "$FRAMEWORK" == "vllm-disagg" ]] || [[ "$FRAMEWORK" == "atom-disagg" ]]; then
+    if [[ "$FRAMEWORK" == "sglang-disagg" ]] || [[ "$FRAMEWORK" == "vllm-disagg" ]] || [[ "$FRAMEWORK" == "atom-disagg" ]] || [[ "$FRAMEWORK" == "tilert" ]]; then
         # Agentic recipes under multi_node/agentic/ export the HiCache tunables;
-        # fixed-seq-len recipes live at the multi_node/ root.
         if [[ "${SCENARIO_SUBDIR}" == "agentic/" ]]; then
             BENCHMARK_SUBDIR="multi_node/agentic"
         else
@@ -115,9 +114,6 @@ if [[ "$IS_MULTINODE" == "true" ]]; then
     wait $POLL_PID
 
     set -x
-
-
-
 
     if [[ "${EVAL_ONLY}" != "true" && "${IS_AGENTIC}" != "1" ]]; then
         cat > collect_latest_results.py <<'PY'
