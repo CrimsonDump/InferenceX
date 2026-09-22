@@ -506,10 +506,16 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 elif [[ "$SKIP_CONTAINER_BARRIER" == "1" ]]; then
     echo "SKIP_CONTAINER_BARRIER=1: caller asserts all containers are up"
 else
+    # --grace 60: after the barrier passes, sync.py keeps the port open for
+    # max(60, timeout/2) seconds in the foreground so a peer one poll behind
+    # still sees it. At CONTAINER_BARRIER_TIMEOUT=5400 that is a 45-minute idle
+    # sleep on every rank (jobs 45373/45374 slept 06:28-07:13). Both ranks pass
+    # within one 5 s poll of each other and the stages below have their own
+    # readiness waits, so 60 s is plenty.
     "$PY" "$WS_PATH/sync.py" barrier \
         --local-ip "${host_ip}" --local-port 5000 --enable-port \
         --node-ips "${IPADDRS}" --node-ports 5000 \
-        --wait-for-all-ports --timeout "$CONTAINER_BARRIER_TIMEOUT" \
+        --wait-for-all-ports --timeout "$CONTAINER_BARRIER_TIMEOUT" --grace 60 \
         || { echo "ERROR: container creation barrier failed after ${CONTAINER_BARRIER_TIMEOUT}s -- the peer rank never opened port 5000." \
                   "A cold image pull is the usual cause: this recipe pulls two ~32 GB images, one per rank, and the rank that" \
                   "comes up first waits out the whole timeout while the other is still pulling." >&2; exit 1; }
