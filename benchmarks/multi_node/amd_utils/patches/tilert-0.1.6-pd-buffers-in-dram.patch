@@ -123,7 +123,7 @@ diff -ru -x __pycache__ orig/receive_server.py new/receive_server.py
          self._lock = threading.Lock()
 diff -ru -x __pycache__ orig/transport.py new/transport.py
 --- a/transport.py	2026-09-22 10:06:55
-+++ b/transport.py	2026-09-22 14:09:20
++++ b/transport.py	2026-09-22 15:17:46
 @@ -8,7 +8,7 @@
      def init(self, host: str) -> None:
          ...
@@ -170,7 +170,7 @@ diff -ru -x __pycache__ orig/transport.py new/transport.py
          h = self._agent.initialize_xfer('WRITE', ld, rd, rname)
          try:
              st = self._agent.transfer(h)
-@@ -86,4 +89,69 @@
+@@ -86,4 +89,63 @@
      key = (name or 'mooncake').lower()
      if key not in _BACKENDS:
          raise ValueError(f'unknown transport {name!r}; choices: {sorted(_BACKENDS)}')
@@ -225,20 +225,14 @@ diff -ru -x __pycache__ orig/transport.py new/transport.py
 +        raise RuntimeError(f'PD host buffer is only {huge / 2**30:.2f} of {total / 2**30:.2f} GiB huge-page backed; '
 +                           'the RDMA MR would fall back to 4 KiB pages and exceed the per-HCA entry budget '
 +                           '(check /sys/kernel/mm/transparent_hugepage/{enabled,defrag} and free memory)')
-+    hip = None
-+    for lib in ('/opt/rocm/lib/libamdhip64.so', 'libamdhip64.so', 'libcudart.so'):
-+        try:
-+            hip = ctypes.CDLL(lib)
-+            break
-+        except OSError:
-+            continue
-+    if hip is None:
-+        raise RuntimeError('neither libamdhip64 nor libcudart could be loaded; the PD host buffer cannot be GPU-registered')
-+    fn = hip.hipHostRegister if hasattr(hip, 'hipHostRegister') else hip.cudaHostRegister
-+    fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
-+    rc = fn(ctypes.c_void_p(addr), ctypes.c_size_t(total), ctypes.c_uint(0))
-+    if rc != 0:
-+        raise RuntimeError(f'hipHostRegister failed rc={rc}')
++    # Register through torch's own GPU runtime binding rather than dlopen'ing a
++    # HIP/CUDA library by name: the tilert-rocm-decode image ships only the
++    # versioned libamdhip64.so.7, the prefill image both names, and CUDA builds
++    # neither. torch.cuda.cudart() is hipified on ROCm and exposes the same
++    # cudaHostRegister on every build. Returns a cudaError enum; 0 is success.
++    rc = torch.cuda.cudart().cudaHostRegister(addr, total, 0)
++    if int(rc) != 0:
++        raise RuntimeError(f'cudaHostRegister/hipHostRegister failed: {rc}')
 +    buf = torch.frombuffer(mm, dtype=torch.uint8, count=total, offset=off)
 +    buf._pd_mmap = mm  # keep the mapping alive with the tensor
 +    return buf
