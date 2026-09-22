@@ -8566,3 +8566,9 @@
   description:
     - "Update the vLLM ROCm image from nightly-d9105ea8 to v0.29.0; benchmark configuration unchanged."
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/3063
+
+- config-keys:
+    - glm5.2-fp8-mi325x-sglang-agentic-mtp
+  description:
+    - "Update the SGLang ROCm image from v0.5.16-rocm720-mi30x to v0.5.19-rocm720-mi30x; benchmark configuration unchanged."
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/2980
