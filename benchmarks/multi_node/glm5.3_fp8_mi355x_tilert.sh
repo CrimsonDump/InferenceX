@@ -61,13 +61,27 @@ export TILERT_RDMA_STRICT=0
 export TILERT_CONVERT_LOCK_WAIT=21600
 export TILERT_SIMULATE_ACC_METHOD=match-expected
 export TILERT_WEIGHTS_DIR="/models/${MODEL_NAME}-tilert-tp${DECODE_TP}"
-export PREFILL_KV_DTYPE=auto
+# fp8 MLA KV on both roles, which is what makes the full 1M context fit.
+# TileRT's MlaNsaProfile.configure() maps fp8_ds_mla/fp8/fp8_e4m3 to the same
+# mla_fp8 layout, and vLLM's ROCM_AITER_MLA_SPARSE backend lists fp8 in its
+# supported_kv_cache_dtypes. Only fp8_ds_mla is CUDA-only, so plain fp8 gives
+# both ranks the matching layout TileRT requires.
+# At bf16 (KV_BYTES_BF16 = 1024 B/token) decode needed a 99.06 GB buffer on top
+# of 184.17 GiB of weights on a 287.98 GiB card and OOM-killed; vLLM prefill
+# refused outright, wanting 91.71 GiB of KV against 85.25 GiB available.
+# fp8 (KV_BYTES_FP8 = 528 B/token) roughly halves both.
+export PREFILL_KV_DTYPE=fp8
 # The ROCm backend supports block sizes [1, 64] and vLLM picks 1, which makes
 # the connector's KI plane copy fail and MLA address the wrong rows.
 export PREFILL_BLOCK_SIZE=64
-export DECODE_KV_DTYPE=bf16           # the ROCm sparse-MLA backend has no fp8_ds_mla
+export DECODE_KV_DTYPE=fp8
 export GPU_MEM_UTIL=0.75
 export SKIP_CONTAINER_BARRIER=0
+# Two images, one per rank, ~32 GB each. On a node that has neither cached the
+# pull alone outlasts the SGLang path's 300s default and the 1800s this script
+# used to hardcode, and the rank that comes up first waits out the whole
+# timeout while its peer is still pulling.
+export CONTAINER_BARRIER_TIMEOUT=5400
 export ROUTER_PORT=30000
 export PREFILL_PORT=8000
 export DECODE_CTRL_PORT=5556

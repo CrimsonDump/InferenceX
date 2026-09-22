@@ -19,7 +19,8 @@ check_env_vars \
     PREFILL_KV_DTYPE PREFILL_BLOCK_SIZE PREFILL_SPEC_TOKENS DECODE_KV_DTYPE \
     DECODE_MTP_SIZE GPU_MEM_UTIL SERVED_MODEL_NAME \
     DECODE_CTRL_PORT DECODE_HTTP_PORT PREFILL_PORT ROUTER_PORT \
-    DECODE_WAIT PREFILL_WAIT ROUTER_WAIT SKIP_CONTAINER_BARRIER
+    DECODE_WAIT PREFILL_WAIT ROUTER_WAIT SKIP_CONTAINER_BARRIER \
+    CONTAINER_BARRIER_TIMEOUT
 
 LOG_DIR="/run_logs/slurm_job-${SLURM_JOB_ID}"
 SHARED_LOG_DIR="${BENCHMARK_LOGS_DIR}/logs/slurm_job-${SLURM_JOB_ID}"
@@ -481,7 +482,10 @@ else
     "$PY" "$WS_PATH/sync.py" barrier \
         --local-ip "${host_ip}" --local-port 5000 --enable-port \
         --node-ips "${IPADDRS}" --node-ports 5000 \
-        --wait-for-all-ports --timeout 1800 || { echo "ERROR: container creation barrier failed" >&2; exit 1; }
+        --wait-for-all-ports --timeout "$CONTAINER_BARRIER_TIMEOUT" \
+        || { echo "ERROR: container creation barrier failed after ${CONTAINER_BARRIER_TIMEOUT}s -- the peer rank never opened port 5000." \
+                  "A cold image pull is the usual cause: this recipe pulls two ~32 GB images, one per rank, and the rank that" \
+                  "comes up first waits out the whole timeout while the other is still pulling." >&2; exit 1; }
 fi
 
 case "$TILERT_ROLE" in
