@@ -68,28 +68,25 @@ export TILERT_MODEL_PKG=glm_5_2_rocm  # per-model converter package, preferred w
 export SERVED_MODEL_NAME=glm5_2
 # GLM-5.3's full context window, as every in-tree GLM-5.2 recipe uses.
 # (202752 is GLM-5.1's, inherited from the B200 TileRT recipe this mirrors.)
-export TILERT_MAX_MODEL_LEN=1048576
+export TILERT_MAX_MODEL_LEN=524288
 export TILERT_TRANSPORT=mooncake
 export TILERT_PARSER=none
 export TILERT_RDMA_STRICT=0
 export TILERT_CONVERT_LOCK_WAIT=21600
 export TILERT_SIMULATE_ACC_METHOD=match-expected
 export TILERT_WEIGHTS_DIR="/models/${MODEL_NAME}-tilert-tp${DECODE_TP}"
-# fp8 MLA KV on both roles, which is what makes the full 1M context fit.
-# TileRT's MlaNsaProfile.configure() maps fp8_ds_mla/fp8/fp8_e4m3 to the same
-# mla_fp8 layout, and vLLM's ROCM_AITER_MLA_SPARSE backend lists fp8 in its
-# supported_kv_cache_dtypes. Only fp8_ds_mla is CUDA-only, so plain fp8 gives
-# both ranks the matching layout TileRT requires.
-# At bf16 (KV_BYTES_BF16 = 1024 B/token) decode needed a 99.06 GB buffer on top
-# of 184.17 GiB of weights on a 287.98 GiB card and OOM-killed; vLLM prefill
-# refused outright, wanting 91.71 GiB of KV against 85.25 GiB available.
-# fp8 (KV_BYTES_FP8 = 528 B/token) roughly halves both.
-export PREFILL_KV_DTYPE=fp8
+# bf16 MLA KV on both roles. The ROCm sparse-MLA backend has no
+# fp8_ds_mla, and its plain fp8 cache is a different layout the TileRT
+# connector rejects outright (see the context note below).
+export PREFILL_KV_DTYPE=auto
 # The ROCm backend supports block sizes [1, 64] and vLLM picks 1, which makes
 # the connector's KI plane copy fail and MLA address the wrong rows.
 export PREFILL_BLOCK_SIZE=64
-export DECODE_KV_DTYPE=fp8
-export GPU_MEM_UTIL=0.75
+export DECODE_KV_DTYPE=bf16           # matches the prefill cache layout
+# vLLM fills its utilization budget rather than stopping at what
+# max-model-len needs, and the connector's staging buffer lives
+# outside that budget, so the two have to be tuned together.
+export GPU_MEM_UTIL=0.60
 export SKIP_CONTAINER_BARRIER=0
 # Two images, one per rank, ~32 GB each. On a node that has neither cached the
 # pull alone outlasts the SGLang path's 300s default and the 1800s this script
