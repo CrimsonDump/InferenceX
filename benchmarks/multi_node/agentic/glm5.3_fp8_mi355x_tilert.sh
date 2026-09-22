@@ -77,12 +77,19 @@ export SERVED_MODEL_NAME=glm5_2
 #   prefill: weights 90.45 GiB + profiling/non-torch 40.3 GiB + vLLM KV 91.71 GiB
 #            + PD staging buffer 99.06 GiB (prefill_connector.py, TP rank 0,
 #              allocated OUTSIDE vLLM's gpu-memory-utilization budget)
-# Both PD buffers must live in pinned host memory (2.9 TB RAM per node) for
+# Both PD buffers must live in pinned host memory (~3.2 TB RAM per node) for
 # this context to start; on the GPU the decode side is node-marginal (~283 of
 # 288 GiB) and the prefill side cannot fit at any utilization (~321 GiB).
-# TileRT 0.1.6 places both on the GPU; bump TILERT_VERSION and the two images
-# to the release that moves them to DRAM. Until then this recipe cannot start.
+# TileRT 0.1.6 places both on the GPU, so setup_deps.sh applies
+# patches/tilert-0.1.6-pd-buffers-in-dram.patch at container start (engine-patch
+# waiver docs/waiver/3330.md) and TILERT_PD_BUFFER_DEVICE=cpu selects the host
+# buffers. They are 2 MiB-backed and verified as such: the ionic RDMA VFs cap
+# 4 KiB-page registrations at ~3.9 GiB per HCA. Cost: two extra PCIe copies on
+# the KV path (~0.83 GB each at 8k tokens, estimated ~17 ms apiece; the RDMA
+# hop itself measured 20.9 GiB/s). Drop the patch and this knob when a TileRT
+# release carries DRAM PD buffers.
 export TILERT_MAX_MODEL_LEN=1048576
+export TILERT_PD_BUFFER_DEVICE=cpu
 export TILERT_TRANSPORT=mooncake
 export TILERT_PARSER=none
 export TILERT_RDMA_STRICT=0
@@ -105,7 +112,8 @@ export DECODE_KV_DTYPE=bf16
 # With the PD staging buffer in host memory, vLLM needs 90.45 (weights) + 40.3
 # (profiling) + 91.71 GiB (KV for one 1048576-token request) = 222.5 GiB inside
 # its budget: 0.85 x 287.98 = 244.8 GiB leaves 22 GiB of KV margin and 43 GiB
-# outside the budget for the ~6 GiB non-torch baseline. 0.75 (216 GiB) refuses
+# outside the budget for the ~6.3 GiB non-torch baseline measured on the decode
+# OOM node (287.98 - 95.94 free - 184.17 - 1.58 reserved). 0.75 (216 GiB) refuses
 # with "91.71 GiB KV cache is needed ... available 85.25 GiB".
 export GPU_MEM_UTIL=0.85
 export SKIP_CONTAINER_BARRIER=0
