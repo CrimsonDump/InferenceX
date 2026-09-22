@@ -70,7 +70,10 @@ if [[ "$SPEC_DECODING" == "mtp" ]]; then
     # The prefill rank only has to build the MTP layer's KV; TileRT decode owns
     # the draft depth (DECODE_MTP_SIZE), so the two counts differ by design.
     PREFILL_SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${PREFILL_SPEC_TOKENS}}")
-    DECODE_MTP=(--with-mtp)
+    # decode_server only accepts depth 3 today, but pass it explicitly so the
+    # converter's --num_mtp, the golden-curve key and the engine depth agree by
+    # data flow rather than by coincidence of defaults.
+    DECODE_MTP=(--with-mtp --num-mtp "$DECODE_MTP_SIZE")
 fi
 
 TILERT_IS_AGENTIC=0
@@ -173,6 +176,17 @@ _tilert_weights_cached() {
     for r in $(seq 0 $((DECODE_TP_SIZE - 1))); do
         [[ -f "$TILERT_WEIGHTS_DIR/rank${r}/model.safetensors.index.json" ]] || return 1
     done
+    # The engine refuses a cache converted without the MTP module (end2end.py
+    # checks tilert_meta.json num_mtp), but only after loading ~90 GiB of
+    # weights. Check the same field here so a stale non-MTP cache is
+    # re-converted instead of failing late.
+    [[ -f "$TILERT_WEIGHTS_DIR/tilert_meta.json" ]] || return 1
+    if [[ "$SPEC_DECODING" == "mtp" ]]; then
+        "$PY" - "$TILERT_WEIGHTS_DIR/tilert_meta.json" <<'PYEOF' || return 1
+import json, sys
+sys.exit(0 if int(json.load(open(sys.argv[1])).get("num_mtp", 0)) >= 1 else 1)
+PYEOF
+    fi
     return 0
 }
 
@@ -197,7 +211,7 @@ convert_weights() {
     if "$PY" -c "import tilert.models.${TILERT_MODEL_PKG}.weight_converter" 2>/dev/null; then
         conv_mod="tilert.models.${TILERT_MODEL_PKG}.weight_converter"
         conv_args=(--model_dir "$MODEL_PATH" --save_dir "$TILERT_WEIGHTS_DIR"
-                   --device "${TILERT_CONVERT_DEVICE:-cuda:$((GPUS_PER_NODE - 1))}")
+                   --device "cuda:$((GPUS_PER_NODE - 1))")
         [[ "$SPEC_DECODING" == "mtp" ]] && conv_args+=(--num_mtp "$DECODE_MTP_SIZE")
     else
         conv_mod="tilert.models.preprocess.weight_converter"

@@ -58,6 +58,12 @@ if [[ "$ENGINE" == "tilert" && -z "${PREFILL_IMAGE:-}" ]]; then
     echo "Error: ENGINE=tilert requires PREFILL_IMAGE (e.g. PREFILL_IMAGE=vllm/vllm-openai-rocm:nightly-<sha> in prefill.additional-settings)."
     exit 1
 fi
+if [[ "$ENGINE" == "tilert" ]]; then
+    # server_tilert.sh takes the container-creation barrier timeout from the
+    # recipe (no 300s default as on the SGLang path); fail here, before sbatch
+    # work is done, rather than inside the container.
+    check_env_vars CONTAINER_BARRIER_TIMEOUT
+fi
 
 # Resolve the models.yaml entry the same way server_sglang.sh does: agentic runs
 # (IS_AGENTIC) use the '<model>-AgentX' recipe, non-agentic disaggregated runs use

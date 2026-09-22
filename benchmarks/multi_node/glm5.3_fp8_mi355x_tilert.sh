@@ -52,8 +52,22 @@ export TILERT_PROFILE=glm5_2          # decode_server --model (TileRT model prof
 export TILERT_MODEL_TYPE=glm-5        # weight_converter --model_type (fallback converter)
 export TILERT_MODEL_PKG=glm_5_2_rocm  # per-model converter package, preferred when importable
 export SERVED_MODEL_NAME=glm5_2
-# GLM-5.3's full context window, as every in-tree GLM-5.2 recipe uses.
-# (202752 is GLM-5.1's, inherited from the B200 TileRT recipe this mirrors.)
+# GLM-5.3's full context window (config.json max_position_embeddings), as every
+# in-tree GLM-5.2 recipe serves. (202752 was GLM-5.1's, inherited from the B200
+# TileRT recipe this mirrors.)
+#
+# Memory at this context, per rank, bf16 wire layout (verified against the
+# tilert 0.1.6 and vLLM 0.24.0 sources and the MI355X logs, 287.98 GiB cards):
+#   decode : weights 90.72 GiB + engine cache window 93.25 GiB
+#            + PD receive buffer 99.06 GiB (receive_server.py, dense in max_seq_len)
+#   prefill: weights 90.45 GiB + profiling/non-torch 40.3 GiB + vLLM KV 91.71 GiB
+#            + PD staging buffer 99.06 GiB (prefill_connector.py, TP rank 0,
+#              allocated OUTSIDE vLLM's gpu-memory-utilization budget)
+# Both PD buffers must live in pinned host memory (2.9 TB RAM per node) for
+# this context to start; on the GPU the decode side is node-marginal (~283 of
+# 288 GiB) and the prefill side cannot fit at any utilization (~321 GiB).
+# TileRT 0.1.6 places both on the GPU; bump TILERT_VERSION and the two images
+# to the release that moves them to DRAM. Until then this recipe cannot start.
 export TILERT_MAX_MODEL_LEN=1048576
 export TILERT_TRANSPORT=mooncake
 export TILERT_PARSER=none
@@ -61,21 +75,25 @@ export TILERT_RDMA_STRICT=0
 export TILERT_CONVERT_LOCK_WAIT=21600
 export TILERT_SIMULATE_ACC_METHOD=match-expected
 export TILERT_WEIGHTS_DIR="/models/${MODEL_NAME}-tilert-tp${DECODE_TP}"
-# fp8 MLA KV on both roles, which is what makes the full 1M context fit.
-# TileRT's MlaNsaProfile.configure() maps fp8_ds_mla/fp8/fp8_e4m3 to the same
-# mla_fp8 layout, and vLLM's ROCM_AITER_MLA_SPARSE backend lists fp8 in its
-# supported_kv_cache_dtypes. Only fp8_ds_mla is CUDA-only, so plain fp8 gives
-# both ranks the matching layout TileRT requires.
-# At bf16 (KV_BYTES_BF16 = 1024 B/token) decode needed a 99.06 GB buffer on top
-# of 184.17 GiB of weights on a 287.98 GiB card and OOM-killed; vLLM prefill
-# refused outright, wanting 91.71 GiB of KV against 85.25 GiB available.
-# fp8 (KV_BYTES_FP8 = 528 B/token) roughly halves both.
-export PREFILL_KV_DTYPE=fp8
+# bf16 MLA KV on both roles. This is the only layout TileRT 0.1.6 can consume
+# from vLLM on ROCm: MlaNsaProfile.classify_layers infers the layout from the
+# cache tensor stride and accepts exactly 1152 B/token (bf16) or 656 B/token
+# (fp8_ds_mla). vLLM's ROCM_AITER_MLA_SPARSE backend has no fp8_ds_mla; its
+# plain "fp8" writes a flat 576 B/token row, which the connector rejects at
+# register_kv_caches. Explicit bfloat16 rather than auto so the stride does not
+# depend on the model dtype. Never float16: it passes the 1152 B check and is
+# then read as bf16.
+export PREFILL_KV_DTYPE=bfloat16
 # The ROCm backend supports block sizes [1, 64] and vLLM picks 1, which makes
 # the connector's KI plane copy fail and MLA address the wrong rows.
 export PREFILL_BLOCK_SIZE=64
-export DECODE_KV_DTYPE=fp8
-export GPU_MEM_UTIL=0.75
+export DECODE_KV_DTYPE=bf16
+# With the PD staging buffer in host memory, vLLM needs 90.45 (weights) + 40.3
+# (profiling) + 91.71 GiB (KV for one 1048576-token request) = 222.5 GiB inside
+# its budget: 0.85 x 287.98 = 244.8 GiB leaves 22 GiB of KV margin and 43 GiB
+# outside the budget for the ~6 GiB non-torch baseline. 0.75 (216 GiB) refuses
+# with "91.71 GiB KV cache is needed ... available 85.25 GiB".
+export GPU_MEM_UTIL=0.85
 export SKIP_CONTAINER_BARRIER=0
 # Two images, one per rank, ~32 GB each. On a node that has neither cached the
 # pull alone outlasts the SGLang path's 300s default and the 1800s this script
