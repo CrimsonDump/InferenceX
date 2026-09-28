@@ -1,4 +1,4 @@
-#  InferenceX™, Open Source Continuous Inference Standard and Research Platform / 开源持续推理标准与研究平台
+#  InferenceX™, Open Source Inference Research Platform / 开源推理研究平台
 <p align="center">
   <a href="https://github.com/SemiAnalysisAI/InferenceX/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg"></a>
   <a href="https://github.com/SemiAnalysisAI/InferenceX/pulls"><img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg"></a>
@@ -18,11 +18,11 @@ Trusted by Operators of Trillion Dollar Token Factories such as OpenAI, Meta, Mi
 
 | Directory | Contents |
 | --- | --- |
-| [`InferenceX-e2e/`](inferencex-e2e/) | End-to-end Inference Serving Benchmarks |
-| [`CollectiveX/`](collectivex/) | Networking & Collective Communication Benchmarks (Experimental Beta) |
-| [`OperatorX/`](operatorx/) | Operator & Kernel Level Benchmarks (Experimental Beta) |
-| [`shared/`](shared/) | Home for shared components |
-| [`experimental/`](experimental/) | Remaining experiments |
+| [`InferenceX-e2e/`](inferencex-e2e/) | 🚀 End-to-end Inference Serving Benchmarks |
+| [`CollectiveX/`](collectivex/) | 🌐 Networking & Collective Communication Benchmarks (Experimental Beta) |
+| [`OperatorX/`](operatorx/) | ⚙️ Operator & Kernel Level Benchmarks (Experimental Beta) |
+| [`shared/`](shared/) | 🧩 Home for shared components |
+| [`experimental/`](experimental/) | 🧪 Remaining experiments |
 
 
 ## News
