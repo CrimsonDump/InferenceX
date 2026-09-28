@@ -14,6 +14,17 @@
 
 Trusted by Operators of Trillion Dollar Token Factories such as OpenAI, Meta, Microsoft, Oracle, etc, & ML Community such as PyTorch Foundation, vLLM, SGLang, Tri Dao
 
+## Projects
+
+| Directory | Contents |
+| --- | --- |
+| [`InferenceX-e2e/`](inferencex-e2e/) | End-to-end Inference Serving Benchmarks |
+| [`CollectiveX/`](collectivex/) | Networking & Collective Communication Benchmarks (Experimental Beta) |
+| [`OperatorX/`](operatorx/) | Operator & Kernel Level Benchmarks (Experimental Beta) |
+| [`shared/`](shared/) | Home for shared components |
+| [`experimental/`](experimental/) | Remaining experiments |
+
+
 ## News
 
 - **[2026/09]** DeepSeek V4.1 Flash: added AgentX benchmarks [dashboard](https://inferencex.semianalysis.com/agentx)
@@ -91,16 +102,3 @@ Finally, we’re grateful to Crusoe, CoreWeave, Nebius, TensorWave, Oracle and T
 Full list of supporters & quotes: https://inferencex.semianalysis.com/quotes
 
 <img width="938" height="487" alt="image" src="https://github.com/user-attachments/assets/aa9b8257-fa7d-4691-97c3-dada8db05cb3" />
-
-
-## Repository layout
-
-| Directory | Contents |
-| --- | --- |
-| [`inferencex-e2e/`](inferencex-e2e/) | End-to-end serving benchmarks, configs, docs, Python tooling, runners, utilities, and performance history |
-| [`collectivex/`](collectivex/) | Collective communication benchmarks |
-| [`operatorx/`](operatorx/) | Operator benchmarks |
-| [`shared/`](shared/) | Home for shared components |
-| [`experimental/`](experimental/) | Remaining experiments |
-
-Run end-to-end commands from `inferencex-e2e/`, which owns `pyproject.toml`, `uv.lock`, and `.python-version`. Repository-wide policy and GitHub workflows remain at the root.
